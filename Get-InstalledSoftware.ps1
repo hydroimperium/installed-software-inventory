@@ -814,8 +814,7 @@ tr:hover td{background:#141821}
     foreach ($cat in @('Приложение', 'Инструмент', 'Игра', 'Store', 'Системное')) {
         $cnt = @($all | Where-Object Category -eq $cat).Count
         if ($cnt -gt 0) {
-            $on = if ($cat -eq 'Системное' -and -not $IncludeSystem) { '' } else { ' on' }
-            [void]$sb.AppendLine("<div class=`"chip$on`" data-c=`"$cat`">$cat<b>$cnt</b></div>")
+            [void]$sb.AppendLine("<div class=`"chip on`" data-c=`"$cat`">$cat<b>$cnt</b></div>")
         }
     }
     [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"hideSys`" $(if (-not $IncludeSystem) { 'checked' })> скрыть служебное</label>")
