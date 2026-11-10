@@ -13,7 +13,7 @@
 ## Быстрый старт
 
 ```powershell
-git clone https://github.com/<you>/installed-software-inventory.git
+git clone https://github.com/hydroimperium/installed-software-inventory.git
 cd installed-software-inventory
 .\Get-InstalledSoftware.ps1 -Open
 ```
