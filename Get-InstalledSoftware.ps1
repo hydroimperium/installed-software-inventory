@@ -155,7 +155,7 @@ function New-App {
         Name      = $clean
         Version   = "$Version".Trim()
         Publisher = "$Publisher".Trim()
-        Path      = if ($Path) { $Path.TrimEnd('\') } else { '' }
+        Path      = if ($Path) { ($Path -replace '/', '\').TrimEnd('\') } else { '' }
         Category  = (Get-Category $clean $Path $Source $Kind)
         Source    = $Source
         Scope     = $Scope
