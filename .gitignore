@@ -1,0 +1,5 @@
+reports/
+overrides.psd1
+*.local.psd1
+.DS_Store
+Thumbs.db
