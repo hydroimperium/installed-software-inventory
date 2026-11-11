@@ -177,6 +177,7 @@ function New-App {
         SizeMB    = $null
         Files     = $null
         Exists    = ''
+        LastRun   = $null
         Extra     = ''
     }
 }
@@ -894,6 +895,75 @@ function Save-Snapshot($apps, [string]$historyPath) {
     $doc | ConvertTo-Json -Depth 4 | Out-File -FilePath $historyPath -Encoding UTF8
 }
 
+# ---------------------------------------------------------------- 11c. usage
+function Rot13([string]$s) {
+    $chars = $s.ToCharArray()
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $c = $chars[$i]
+        if ($c -ge 'a' -and $c -le 'z') { $chars[$i] = [char]((([int]$c - 97 + 13) % 26) + 97) }
+        elseif ($c -ge 'A' -and $c -le 'Z') { $chars[$i] = [char]((([int]$c - 65 + 13) % 26) + 65) }
+    }
+    return -join $chars
+}
+
+function Get-UsageIndex {
+    $res = New-Object System.Collections.ArrayList
+    $root = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist'
+    $known = @{
+        '{6D809377-6AF0-444B-8957-A3773F02200E}' = 'C:\Program Files'
+        '{7C5A40EF-A0FB-4BFC-874A-C0F2E0B9FA8E}' = 'C:\Program Files (x86)'
+        '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}' = 'C:\Windows\System32'
+        '{F38BF404-1D43-42F2-9305-67DE0B28FC23}' = 'C:\Windows'
+    }
+    foreach ($k in (Get-ChildItem $root -ErrorAction SilentlyContinue)) {
+        $item = Get-Item (Join-Path $k.PSPath 'Count') -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        foreach ($name in $item.GetValueNames()) {
+            $decoded = Rot13 $name
+            if ($decoded -match '^\{[0-9A-Fa-f\-]+\}\\(.+)$') {
+                $g = $decoded.Substring(0, $decoded.IndexOf('}') + 1)
+                $rest = $matches[1]
+                if ($known.ContainsKey($g)) { $decoded = Join-Path $known[$g] $rest }
+                else { $decoded = $rest }
+            }
+            if ($decoded -notmatch '^[A-Za-z]:\\') { continue }
+            $raw = $item.GetValue($name)
+            if ($raw.Length -lt 68) { continue }
+            $ft = [BitConverter]::ToInt64($raw, 60)
+            if ($ft -le 0) { continue }
+            try { $last = [DateTime]::FromFileTime($ft) } catch { continue }
+            if ($last.Year -lt 2000) { continue }
+            [void]$res.Add([pscustomobject]@{ Path = $decoded; Last = $last })
+        }
+    }
+    return $res
+}
+
+function Add-Usage($apps) {
+    $usage = Get-UsageIndex
+    if (-not $usage.Count) { return $apps }
+    Write-Step ("  данные о запусках: {0} записей" -f $usage.Count)
+    foreach ($a in $apps) {
+        if (-not $a.Path) { continue }
+        $p = $a.Path.ToLower()
+        $best = $null
+        foreach ($u in $usage) {
+            $up = $u.Path.ToLower()
+            if ($up -eq $p -or $up.StartsWith($p + '\')) {
+                if (-not $best -or $u.Last -gt $best) { $best = $u.Last }
+            }
+        }
+        if (-not $best) {
+            $leaf = Split-Path -Leaf $a.Path
+            foreach ($u in $usage) {
+                if ((Split-Path -Leaf $u.Path) -ieq $leaf) { if (-not $best -or $u.Last -gt $best) { $best = $u.Last } }
+            }
+        }
+        if ($best) { $a.LastRun = $best }
+    }
+    return $apps
+}
+
 # ---------------------------------------------------------------- 12. report
 function Esc([string]$s) { if (-not $s) { return '' }; return [System.Net.WebUtility]::HtmlEncode($s) }
 
@@ -909,7 +979,8 @@ function Export-Report($apps, $skipped, $changes) {
     $all = $apps | Sort-Object @{ Expression = { if ($catOrder.ContainsKey($_.Category)) { $catOrder[$_.Category] } else { 9 } } }, Name
 
     $all | Select-Object Category, Name, Version, Publisher, SizeMB, Files, Path, Source, Scope, Kind, Exists, Uninstall,
-        @{ n = 'Change'; e = { $k = (Get-Norm $_.Name) + '|' + "$($_.Path)".ToLower(); if ($changes.New.ContainsKey($k)) { 'новое' } elseif ($changes.Updated.ContainsKey($k)) { 'обновлено' } else { '' } } } |
+        @{ n = 'Change'; e = { $k = (Get-Norm $_.Name) + '|' + "$($_.Path)".ToLower(); if ($changes.New.ContainsKey($k)) { 'новое' } elseif ($changes.Updated.ContainsKey($k)) { 'обновлено' } else { '' } } },
+        @{ n = 'LastRun'; e = { if ($_.LastRun) { $_.LastRun.ToString('yyyy-MM-dd HH:mm') } else { '' } } } |
         Export-Csv -Path (Join-Path $OutputDir 'software-inventory.csv') -NoTypeInformation -Encoding UTF8
 
     if ($changes.HasPrev) {
@@ -991,6 +1062,8 @@ tr:hover td{background:#141821}
 .b-upd{background:#3b3a1e;color:#e7d96e}
 .plink{color:#9fb3d1;text-decoration:none;border-bottom:1px dotted #4a5568}
 .plink:hover{color:#cfe0ff;border-bottom-color:#5b9dff}
+.run{color:#9fb3d1;font-variant-numeric:tabular-nums;white-space:nowrap}
+.run.never{color:#5f6675}
 .empty{padding:40px;text-align:center;color:var(--dim)}
 @media(max-width:900px){header,main{padding-left:14px;padding-right:14px}th:nth-child(3),td:nth-child(3){display:none}}
 '@)
@@ -1010,10 +1083,11 @@ tr:hover td{background:#141821}
     }
     [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"hideSys`" $(if (-not $IncludeSystem) { 'checked' })> скрыть служебное</label>")
     [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"hideMs`"> скрыть Microsoft</label>")
+    [void]$sb.AppendLine("<label class=`"sw`" title=`"журнал проводника: программы из автозагрузки и консольные могут не иметь записи`"><input type=`"checkbox`" id=`"onlyUnused`"> нет записи о запуске</label>")
     if ($changes.HasPrev) {
         [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"onlyNew`"> только изменения</label>")
     }
-    [void]$sb.AppendLine('</div></header><main><table id="t"><thead><tr><th class="n">#</th><th data-s="name">Название</th><th data-s="ver">Версия</th><th data-s="pub">Издатель</th><th data-s="size">Размер</th><th data-s="path">Путь</th><th data-s="cat">Категория</th></tr></thead><tbody>')
+    [void]$sb.AppendLine('</div></header><main><table id="t"><thead><tr><th class="n">#</th><th data-s="name">Название</th><th data-s="ver">Версия</th><th data-s="pub">Издатель</th><th data-s="size">Размер</th><th data-s="run">Запуск</th><th data-s="path">Путь</th><th data-s="cat">Категория</th></tr></thead><tbody>')
 
     $i = 0
     foreach ($a in $all) {
@@ -1040,21 +1114,25 @@ tr:hover td{background:#141821}
         }
         $sys = if ($a.Category -eq 'Системное') { '1' } else { '0' }
         $ms = if ($a.Publisher -match '(?i)Microsoft|Майкрософт') { '1' } else { '0' }
-        [void]$sb.AppendLine("<tr data-c=`"$($a.Category)`" data-sys=`"$sys`" data-ms=`"$ms`" data-new=`"$isNew`" data-upd=`"$isUpd`" data-mb=`"$($a.SizeMB)`"><td class=`"n`">$i</td><td class=`"name`" data-v=`"$(Esc $a.Name)`">$(Esc $a.Name)$badge</td><td class=`"ver`" data-v=`"$(Esc $v)`">$(Esc $v)</td><td class=`"pub`" data-v=`"$(Esc $pub)`">$(Esc $pub)</td><td class=`"size`" data-v=`"$($a.SizeMB)`">$(Format-Size $a.SizeMB)</td><td class=`"path`" data-v=`"$(Esc $p)`">$pathCell</td><td><span class=`"tag $cls`">$($a.Category)</span></td></tr>")
+        $run = if ($a.LastRun) { $a.LastRun.ToString('dd.MM.yy') } else { '—' }
+        $runV = if ($a.LastRun) { $a.LastRun.ToString('yyyyMMdd') } else { '0' }
+        $runCls = if ($a.LastRun) { 'run' } else { 'run never' }
+        [void]$sb.AppendLine("<tr data-c=`"$($a.Category)`" data-sys=`"$sys`" data-ms=`"$ms`" data-new=`"$isNew`" data-upd=`"$isUpd`" data-run=`"$(if ($a.LastRun) { 1 } else { 0 })`" data-mb=`"$($a.SizeMB)`"><td class=`"n`">$i</td><td class=`"name`" data-v=`"$(Esc $a.Name)`">$(Esc $a.Name)$badge</td><td class=`"ver`" data-v=`"$(Esc $v)`">$(Esc $v)</td><td class=`"pub`" data-v=`"$(Esc $pub)`">$(Esc $pub)</td><td class=`"size`" data-v=`"$($a.SizeMB)`">$(Format-Size $a.SizeMB)</td><td class=`"$runCls`" data-v=`"$runV`" title=`"последний запуск по данным проводника`">$run</td><td class=`"path`" data-v=`"$(Esc $p)`">$pathCell</td><td><span class=`"tag $cls`">$($a.Category)</span></td></tr>")
     }
     [void]$sb.AppendLine('</tbody></table><div class="empty" id="none" style="display:none">Ничего не найдено</div></main>')
     [void]$sb.AppendLine(@'
 <script>
 const q=document.getElementById('q'),rows=[...document.querySelectorAll('#t tbody tr')],none=document.getElementById('none');
-const chips=[...document.querySelectorAll('.chip')],hideSys=document.getElementById('hideSys'),hideMs=document.getElementById('hideMs'),onlyNew=document.getElementById('onlyNew');
+const chips=[...document.querySelectorAll('.chip')],hideSys=document.getElementById('hideSys'),hideMs=document.getElementById('hideMs'),onlyNew=document.getElementById('onlyNew'),onlyUnused=document.getElementById('onlyUnused');
 let active=new Set(chips.filter(c=>c.classList.contains('on')).map(c=>c.dataset.c));
 function apply(){const s=q.value.toLowerCase().trim();let n=0;
  rows.forEach(r=>{const okC=active.has(r.dataset.c);const okS=!s||r.textContent.toLowerCase().includes(s);
   const okY=!(hideSys.checked&&r.dataset.sys==='1');const okM=!(hideMs&&hideMs.checked&&r.dataset.ms==='1');
   const okN=!(onlyNew&&onlyNew.checked&&r.dataset.new!=='1'&&r.dataset.upd!=='1');
-  const show=okC&&okS&&okY&&okM&&okN;r.style.display=show?'':'none';if(show)n++;});
+  const okU=!(onlyUnused&&onlyUnused.checked&&r.dataset.run!=='0');
+  const show=okC&&okS&&okY&&okM&&okN&&okU;r.style.display=show?'':'none';if(show)n++;});
  none.style.display=n?'none':'block';document.getElementById('total').textContent=n;}
-q.addEventListener('input',apply);hideSys.addEventListener('change',apply);if(hideMs)hideMs.addEventListener('change',apply);if(onlyNew)onlyNew.addEventListener('change',apply);
+q.addEventListener('input',apply);hideSys.addEventListener('change',apply);if(hideMs)hideMs.addEventListener('change',apply);if(onlyNew)onlyNew.addEventListener('change',apply);if(onlyUnused)onlyUnused.addEventListener('change',apply);
 chips.forEach(c=>c.addEventListener('click',()=>{const k=c.dataset.c;if(active.has(k)){active.delete(k);c.classList.remove('on')}else{active.add(k);c.classList.add('on')}apply();}));
 document.querySelectorAll('th[data-s]').forEach(th=>{let asc=true;th.addEventListener('click',()=>{const tb=document.querySelector('#t tbody');const rs=[...tb.rows];const idx=[...th.parentNode.children].indexOf(th);
  rs.sort((a,b)=>{const x=a.cells[idx].dataset.v||a.cells[idx].textContent,y=b.cells[idx].dataset.v||b.cells[idx].textContent;return x.localeCompare(y,'ru',{numeric:true})*(asc?1:-1)});
@@ -1120,6 +1198,7 @@ $apps = Merge-Apps $apps
 if (-not $OverridesPath) { $OverridesPath = Join-Path $PSScriptRoot 'overrides.psd1' }
 $apps = Apply-Overrides $apps $OverridesPath
 $apps = Test-Apps $apps
+$apps = Add-Usage $apps
 
 $historyPath = Join-Path $OutputDir 'history.json'
 $changes = Get-ChangeSet $apps $historyPath
