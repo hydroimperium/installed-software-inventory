@@ -622,7 +622,7 @@ function Get-DiskApps($known) {
         }
         $name = Get-CleanName $name
         if ($name -match '^[0-9a-fA-F]{8,}$') {
-            $up1 = Split-Path -Parent $d
+            $up1 = Split-Path -Parent $dir
             $up2 = Split-Path -Parent $up1
             if ((Split-Path -Leaf $up1) -match '(?i)^(bin|bin64|x64|win64)$' -and $up2) {
                 $name = Split-Path -Leaf $up2
