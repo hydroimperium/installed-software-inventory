@@ -139,7 +139,7 @@ function Test-AppFolder([string]$path, [double]$minMB, [int]$minFiles, [string]$
     return $true
 }
 
-$SystemRx = '(?i)Visual C\+\+|\.NET (SDK|Runtime|Desktop Runtime)|Windows Desktop Runtime|Windows SDK|DirectX|Edge WebView2|Edge Update|Epic Online Services|Mozilla Maintenance|AMD[ _](Chipset|Install)|Realtek Card Reader|EpsonNet|Драйвер принтера|Application Compatibility|Application Virtualization|Windows Subsystem for Linux|^WSL|WinAppRuntime|ShellExtension|ContextMenu|SparseApp|Winget\.Source|DesktopAppInstaller|StorePurchaseApp|LanguageExperiencePack|VCLibs|Microsoft\.UI\.Xaml|HostRuntime|AppRuntime|Windows App Runtime|Windows Media Player|Windows Photo Viewer|Windows Defender|Microsoft Office$|Razer S3|Razer.*Wizard'
+$SystemRx = '(?i)Visual C\+\+|\.NET (SDK|Runtime|Desktop Runtime)|Windows Desktop Runtime|Windows SDK|DirectX|Edge WebView2|Edge Update|Epic Online Services|Mozilla Maintenance|AMD[ _](Chipset|Install)|Realtek Card Reader|EpsonNet|Драйвер принтера|Application Compatibility|Application Virtualization|Windows Subsystem for Linux|^WSL|WinAppRuntime|ShellExtension|ContextMenu|SparseApp|Winget\.Source|DesktopAppInstaller|StorePurchaseApp|LanguageExperiencePack|VCLibs|Microsoft\.UI\.Xaml|HostRuntime|AppRuntime|PlatformRuntime|Windows App Runtime|Windows Media Player|Windows Photo Viewer|Windows Defender|Microsoft Office$|Razer S3|Razer.*Wizard'
 $ToolRx   = '(?i)Visual Studio Code|Android Studio|Android SDK|IntelliJ|PyCharm|WebStorm|^Git$|GitHub CLI|Node\.js|Python|OpenJDK|Temurin|JDK|Docker|Postman|Scoop|Maestro|Cursor|Devin|Antigravity|OpenCode|DeepSeek|Codex|Blender|Godot|NekoBox|LockHunter|WinRAR|7-Zip|PowerToys|zapret|Ubuntu|Bun$|Chocolatey|spicetify'
 $GamePathRx = '(?i)steamapps\\common|\\Games\\|\\torrent\\|GOG Games'
 
@@ -178,6 +178,8 @@ function New-App {
         Files     = $null
         Exists    = ''
         LastRun   = $null
+        Copies    = 1
+        OtherPaths = ''
         Extra     = ''
     }
 }
@@ -256,11 +258,14 @@ function Get-StoreApps {
             $display = $manifest.Package.Properties.DisplayName
         } catch {}
         if (-not $display -or $display -match '^ms-resource:') { $display = $_.Name }
-        [void]$out.Add((New-App -Name $display -Version "$($_.Version)" -Publisher "$($_.PublisherDisplayName)" `
+        $pub = "$($_.PublisherDisplayName)".Trim()
+        if (-not $pub) { $pub = (("$($_.Publisher)" -split ',')[0] -replace '^CN=', '').Trim() }
+        [void]$out.Add((New-App -Name $display -Version "$($_.Version)" -Publisher $pub `
                     -Path $_.InstallLocation -Source 'Microsoft Store' `
                     -Scope $(if ($_.InstallLocation -like "$env:LOCALAPPDATA*") { 'Пользователь' } else { 'Система' }) `
                     -Uninstall "Get-AppxPackage -Name '$($_.Name)' | Remove-AppxPackage" -Kind 'Store'))
         $out[$out.Count - 1].Extra = $_.Name
+        if ($_.Name -match $SystemRx) { $out[$out.Count - 1].Category = 'Системное' }
     }
     return $out
 }
@@ -926,18 +931,30 @@ function Get-UsageIndex {
                 if ($known.ContainsKey($g)) { $decoded = Join-Path $known[$g] $rest }
                 else { $decoded = $rest }
             }
-            if ($decoded -notmatch '^[A-Za-z]:\\') { continue }
+            if ($decoded -notmatch '^[A-Za-z]:\\') {
+                $decodedPath = ''
+            }
+            else { $decodedPath = $decoded }
             $raw = $item.GetValue($name)
             if ($raw.Length -lt 68) { continue }
             $ft = [BitConverter]::ToInt64($raw, 60)
             if ($ft -le 0) { continue }
             try { $last = [DateTime]::FromFileTime($ft) } catch { continue }
             if ($last.Year -lt 2000) { continue }
-            [void]$res.Add([pscustomobject]@{ Path = $decoded; Last = $last })
+            [void]$res.Add([pscustomobject]@{ Path = $decodedPath; Alias = (Get-Norm $decoded); Last = $last })
         }
     }
     return $res
 }
+
+$script:AliasRules = @(
+    @{ Alias = '(?i)office'; Name = 'office' }
+    @{ Alias = '(?i)visualstudiocode'; Name = 'visual studio code' }
+    @{ Alias = '(?i)chrome'; Name = 'chrome' }
+    @{ Alias = '(?i)discord'; Name = 'discord' }
+    @{ Alias = '(?i)powertoys'; Name = 'powertoys' }
+    @{ Alias = '(?i)codex|chatgpt'; Name = 'chatgpt' }
+)
 
 function Add-Usage($apps) {
     $usage = Get-UsageIndex
@@ -959,9 +976,48 @@ function Add-Usage($apps) {
                 if ((Split-Path -Leaf $u.Path) -ieq $leaf) { if (-not $best -or $u.Last -gt $best) { $best = $u.Last } }
             }
         }
+        if (-not $best -and $a.Category -in @('Приложение', 'Инструмент') -and
+            $a.Name -notmatch '(?i)Context Menu|ShellExtension|SparseApp|Runtime|Installer') {
+            $appNorm = Get-Norm $a.Name
+            foreach ($rule in $script:AliasRules) {
+                if ($appNorm -notmatch [regex]::Escape((Get-Norm $rule.Name))) { continue }
+                foreach ($u in $usage) {
+                    if ($u.Alias -match $rule.Alias) {
+                        if (-not $best -or $u.Last -gt $best) { $best = $u.Last }
+                    }
+                }
+            }
+        }
         if ($best) { $a.LastRun = $best }
     }
     return $apps
+}
+
+# ---------------------------------------------------------------- 11d. copies
+function Group-Copies($apps) {
+    Write-Step 'Группировка копий...'
+    $byName = @{}
+    $out = New-Object System.Collections.ArrayList
+    foreach ($a in $apps) {
+        $base = $a.Name -replace '\s*\(копия \d+\)\s*$', ''
+        $n = Get-Norm $base
+        if (-not $n) { [void]$out.Add($a); continue }
+        if (-not $byName.ContainsKey($n)) {
+            $byName[$n] = $a
+            [void]$out.Add($a)
+            continue
+        }
+        $primary = $byName[$n]
+        # копией считаем только тот же продукт: совпадает категория или источник
+        $primary.Copies++
+        if ($a.Path) {
+            $primary.OtherPaths = if ($primary.OtherPaths) { "$($primary.OtherPaths) | $($a.Path)" } else { $a.Path }
+        }
+        if ($a.SizeMB -and $primary.SizeMB) { $primary.SizeMB = $primary.SizeMB + $a.SizeMB }
+        elseif ($a.SizeMB) { $primary.SizeMB = $a.SizeMB }
+        if ($a.LastRun -and (-not $primary.LastRun -or $a.LastRun -gt $primary.LastRun)) { $primary.LastRun = $a.LastRun }
+    }
+    return $out
 }
 
 # ---------------------------------------------------------------- 12. report
@@ -978,7 +1034,7 @@ function Export-Report($apps, $skipped, $changes) {
     $catOrder = @{ 'Приложение' = 0; 'Инструмент' = 1; 'Игра' = 2; 'Store' = 3; 'Системное' = 4 }
     $all = $apps | Sort-Object @{ Expression = { if ($catOrder.ContainsKey($_.Category)) { $catOrder[$_.Category] } else { 9 } } }, Name
 
-    $all | Select-Object Category, Name, Version, Publisher, SizeMB, Files, Path, Source, Scope, Kind, Exists, Uninstall,
+    $all | Select-Object Category, Name, Version, Publisher, SizeMB, Files, Path, Copies, OtherPaths, Source, Scope, Kind, Exists, Uninstall,
         @{ n = 'Change'; e = { $k = (Get-Norm $_.Name) + '|' + "$($_.Path)".ToLower(); if ($changes.New.ContainsKey($k)) { 'новое' } elseif ($changes.Updated.ContainsKey($k)) { 'обновлено' } else { '' } } },
         @{ n = 'LastRun'; e = { if ($_.LastRun) { $_.LastRun.ToString('yyyy-MM-dd HH:mm') } else { '' } } } |
         Export-Csv -Path (Join-Path $OutputDir 'software-inventory.csv') -NoTypeInformation -Encoding UTF8
@@ -1064,6 +1120,7 @@ tr:hover td{background:#141821}
 .plink:hover{color:#cfe0ff;border-bottom-color:#5b9dff}
 .run{color:#9fb3d1;font-variant-numeric:tabular-nums;white-space:nowrap}
 .run.never{color:#5f6675}
+.copies{display:inline-block;margin-left:6px;padding:0 6px;border-radius:8px;background:#22304a;color:#7fb3ff;font-size:11px;font-weight:600;cursor:help}
 .empty{padding:40px;text-align:center;color:var(--dim)}
 @media(max-width:900px){header,main{padding-left:14px;padding-right:14px}th:nth-child(3),td:nth-child(3){display:none}}
 '@)
@@ -1082,7 +1139,7 @@ tr:hover td{background:#141821}
         if ($cnt -gt 0) { [void]$sb.AppendLine("<div class=`"chip on`" data-c=`"$cat`">$cat<b>$cnt</b></div>") }
     }
     [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"hideSys`" $(if (-not $IncludeSystem) { 'checked' })> скрыть служебное</label>")
-    [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"hideMs`"> скрыть Microsoft</label>")
+    [void]$sb.AppendLine("<label class=`"sw`" title=`"убирает компоненты Windows и Microsoft, которые вы не запускаете сами`"><input type=`"checkbox`" id=`"hideMs`"> скрыть Microsoft и компоненты</label>")
     [void]$sb.AppendLine("<label class=`"sw`" title=`"журнал проводника: программы из автозагрузки и консольные могут не иметь записи`"><input type=`"checkbox`" id=`"onlyUnused`"> нет записи о запуске</label>")
     if ($changes.HasPrev) {
         [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"onlyNew`"> только изменения</label>")
@@ -1113,10 +1170,17 @@ tr:hover td{background:#141821}
             $pathCell = "<a class=`"plink`" href=`"$href`" title=`"Открыть папку`">$pathCell</a>"
         }
         $sys = if ($a.Category -eq 'Системное') { '1' } else { '0' }
-        $ms = if ($a.Publisher -match '(?i)Microsoft|Майкрософт') { '1' } else { '0' }
+        $msPub  = $a.Publisher -match '(?i)Microsoft|Майкрософт'
+        $msName = $a.Name -match '(?i)^(Microsoft|Windows|WinAppRuntime|ms-resource|Пакет локализованного)'
+        $msPath = $a.Path -match '(?i)^C:\\Windows(\\|$)|\\WindowsApps\\Microsoft|^C:\\Program Files\\Microsoft(\\|$)|^C:\\Program Files \(x86\)\\Microsoft(\\|$)'
+        $ms = if ($msPub -or $msName -or $msPath) { '1' } else { '0' }
         $run = if ($a.LastRun) { $a.LastRun.ToString('dd.MM.yy') } else { '—' }
         $runV = if ($a.LastRun) { $a.LastRun.ToString('yyyyMMdd') } else { '0' }
         $runCls = if ($a.LastRun) { 'run' } else { 'run never' }
+        if ($a.Copies -gt 1) {
+            $extraPaths = Esc ($a.OtherPaths -replace '\|', "`n")
+            $pathCell = "$pathCell <span class=`"copies`" title=`"ещё путей: $($a.Copies - 1)`n$extraPaths`">+$($a.Copies - 1)</span>"
+        }
         [void]$sb.AppendLine("<tr data-c=`"$($a.Category)`" data-sys=`"$sys`" data-ms=`"$ms`" data-new=`"$isNew`" data-upd=`"$isUpd`" data-run=`"$(if ($a.LastRun) { 1 } else { 0 })`" data-mb=`"$($a.SizeMB)`"><td class=`"n`">$i</td><td class=`"name`" data-v=`"$(Esc $a.Name)`">$(Esc $a.Name)$badge</td><td class=`"ver`" data-v=`"$(Esc $v)`">$(Esc $v)</td><td class=`"pub`" data-v=`"$(Esc $pub)`">$(Esc $pub)</td><td class=`"size`" data-v=`"$($a.SizeMB)`">$(Format-Size $a.SizeMB)</td><td class=`"$runCls`" data-v=`"$runV`" title=`"последний запуск по данным проводника`">$run</td><td class=`"path`" data-v=`"$(Esc $p)`">$pathCell</td><td><span class=`"tag $cls`">$($a.Category)</span></td></tr>")
     }
     [void]$sb.AppendLine('</tbody></table><div class="empty" id="none" style="display:none">Ничего не найдено</div></main>')
@@ -1127,7 +1191,8 @@ const chips=[...document.querySelectorAll('.chip')],hideSys=document.getElementB
 let active=new Set(chips.filter(c=>c.classList.contains('on')).map(c=>c.dataset.c));
 function apply(){const s=q.value.toLowerCase().trim();let n=0;
  rows.forEach(r=>{const okC=active.has(r.dataset.c);const okS=!s||r.textContent.toLowerCase().includes(s);
-  const okY=!(hideSys.checked&&r.dataset.sys==='1');const okM=!(hideMs&&hideMs.checked&&r.dataset.ms==='1');
+  const okY=!(hideSys.checked&&r.dataset.sys==='1');
+  const okM=!(hideMs&&hideMs.checked&&(r.dataset.ms==='1'||r.dataset.sys==='1')&&r.dataset.run==='0');
   const okN=!(onlyNew&&onlyNew.checked&&r.dataset.new!=='1'&&r.dataset.upd!=='1');
   const okU=!(onlyUnused&&onlyUnused.checked&&r.dataset.run!=='0');
   const show=okC&&okS&&okY&&okM&&okN&&okU;r.style.display=show?'':'none';if(show)n++;});
@@ -1199,6 +1264,7 @@ if (-not $OverridesPath) { $OverridesPath = Join-Path $PSScriptRoot 'overrides.p
 $apps = Apply-Overrides $apps $OverridesPath
 $apps = Test-Apps $apps
 $apps = Add-Usage $apps
+$apps = Group-Copies $apps
 
 $historyPath = Join-Path $OutputDir 'history.json'
 $changes = Get-ChangeSet $apps $historyPath
