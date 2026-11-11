@@ -107,6 +107,14 @@ $script:StatsCache = @{}
 function Get-FolderStats([string]$path) {
     if (-not $path) { return $null }
     if ($script:StatsCache.ContainsKey($path)) { return $script:StatsCache[$path] }
+    if ($script:DiskIndex -and $script:DiskIndex.Sizes.ContainsKey($path)) {
+        $r = [pscustomobject]@{
+            SizeMB = [math]::Round($script:DiskIndex.Sizes[$path] / 1MB, 1)
+            Files  = $script:DiskIndex.Counts[$path]
+        }
+        $script:StatsCache[$path] = $r
+        return $r
+    }
     $r = [pscustomobject]@{ SizeMB = 0; Files = 0 }
     if ($path -match '^[A-Za-z]:\\' -and (Test-Path -LiteralPath $path -PathType Leaf)) {
         $f = Get-Item -LiteralPath $path
@@ -227,7 +235,7 @@ function Get-RegistryApps {
             if (-not $loc) {
                 $nn = Get-Norm $_.DisplayName
                 foreach ($key in $appPaths.Keys) {
-                    if ($key.Length -ge 3 -and ($nn -like "*$key*" -or $key -like "*$nn*")) {
+                    if ($key.Length -ge 4 -and ($nn -like "*$key*" -or $key -like "*$nn*")) {
                         $loc = Split-Path -Parent $appPaths[$key]
                         break
                     }
@@ -249,6 +257,11 @@ function Get-RegistryApps {
 function Get-StoreApps {
     Write-Step 'Приложения Microsoft Store...'
     $out = New-Object System.Collections.ArrayList
+    $startNames = @{}
+    Get-StartApps | ForEach-Object {
+        $pf = ("$($_.AppID)" -split '!')[0]
+        if ($pf -and -not $startNames.ContainsKey($pf)) { $startNames[$pf] = $_.Name }
+    }
     Get-AppxPackage | Where-Object {
         -not $_.IsFramework -and -not $_.IsResourcePackage -and $_.SignatureKind -ne 'System'
     } | ForEach-Object {
@@ -257,6 +270,10 @@ function Get-StoreApps {
             $manifest = Get-AppxPackageManifest $_
             $display = $manifest.Package.Properties.DisplayName
         } catch {}
+        if (-not $display -or $display -match '^ms-resource:') {
+            if ($startNames.ContainsKey($_.PackageFamilyName)) { $display = $startNames[$_.PackageFamilyName] }
+            elseif (-not $display) { $display = $_.Name }
+        }
         if (-not $display -or $display -match '^ms-resource:') { $display = $_.Name }
         $pub = "$($_.PublisherDisplayName)".Trim()
         if (-not $pub) { $pub = (("$($_.Publisher)" -split ',')[0] -replace '^CN=', '').Trim() }
@@ -428,6 +445,25 @@ function Get-ToolchainApps {
         $st = Get-FolderStats $wvRoot; $a.SizeMB = $st.SizeMB; $a.Files = $st.Files
         [void]$out.Add($a)
     }
+
+    # копии Android SDK вне стандартного места (platform-tools + build-tools в одной папке)
+    foreach ($drv in (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Root -match '^[A-Z]:\\$' })) {
+        Get-ChildItem $drv.Root -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $d = $_.FullName
+            if ((Test-Path (Join-Path $d 'platform-tools\adb.exe')) -and (Test-Path (Join-Path $d 'build-tools'))) {
+                $parts = @('platform-tools', 'build-tools', 'emulator', 'platforms', 'sources', 'extras', 'system-images') |
+                    ForEach-Object { Join-Path $d $_ } | Where-Object { Test-Path $_ }
+                $sizeMB = 0.0; $files = 0
+                foreach ($part in $parts) {
+                    $st = Get-FolderStats $part
+                    if ($st) { $sizeMB += $st.SizeMB; $files += $st.Files }
+                }
+                $a = New-App -Name 'Android SDK (копия)' -Version '' -Publisher 'Google' -Path $d -Source 'Toolchain' -Scope 'Пользователь' -Kind 'Портативно'
+                $a.SizeMB = [math]::Round($sizeMB, 1); $a.Files = $files
+                [void]$out.Add($a)
+            }
+        }
+    }
     return $out
 }
 
@@ -442,15 +478,15 @@ function Get-DiskRoots {
     return $roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Sort-Object -Unique
 }
 
-$WalkSkipRx = '(?i)\\(Windows|WinSxS|\$Recycle\.Bin|System Volume Information|WindowsApps|Installer|Package Cache|Temp|temp|node_modules|\.git|\.cache|__pycache__|site-packages|\.gradle|\.docker|\.nuget|\.m2|\.cargo|\.rustup|\.android|\.kotlin|\.vscode|\.idea|globalStorage|JetBrains|ClickToRun|_components|OneDrive|\.tlauncher|build-tools|platform-tools|chocolatey\\lib)(\\|$)'
+$WalkSkipRx = '(?i)\\(WinSxS|\$Recycle\.Bin|System Volume Information|WindowsApps|Installer|Package Cache|Temp|temp|node_modules|\.git|\.cache|__pycache__|site-packages|\.gradle|\.docker|\.nuget|\.m2|\.cargo|\.rustup|\.android|\.kotlin|\.vscode|\.idea|globalStorage|JetBrains|ClickToRun|_components|OneDrive|\.tlauncher|build-tools|platform-tools|chocolatey\\lib)(\\|$)'
 
 function Get-DiskIndex {
     if ($script:DiskIndex) { return $script:DiskIndex }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $exes = New-Object System.Collections.Generic.List[object]
-    $sizes = New-Object 'System.Collections.Generic.Dictionary[string,long]'
-    $counts = New-Object 'System.Collections.Generic.Dictionary[string,int]'
-    $dlls = New-Object 'System.Collections.Generic.Dictionary[string,int]'
+    $sizes = [System.Collections.Generic.Dictionary[string, long]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $counts = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $dlls = [System.Collections.Generic.Dictionary[string, int]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     $stack = New-Object System.Collections.Generic.Stack[string]
     foreach ($r in (Get-DiskRoots)) { $stack.Push($r) }
@@ -458,7 +494,7 @@ function Get-DiskIndex {
     $processed = 0
     while ($stack.Count -gt 0) {
         $dir = $stack.Pop()
-        if ($dir -match $WalkSkipRx) { continue }
+        if ($dir -match $WalkSkipRx -or $dir -match '^[A-Za-z]:\\Windows(\\|$)') { continue }
         $di = $null
         try { $di = New-Object System.IO.DirectoryInfo $dir } catch { continue }
         if ($di.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
@@ -504,10 +540,31 @@ function Get-DiskIndex {
 }
 
 # ---------------------------------------------------------------- 8. disk apps
-$JunkDirRx = '(?i)\\(updater|updaters|update|updates|pending|download|downloads|installer|installers|setup|crashpad|crash|crashreporter|logs?|cache|temp|tmp|backup|backups|old|previous|obsolete|node_modules|__pycache__|site-packages|\.venv|venv|dist|build|obj|target|out|bin|bin64|lib|libs|lib64|include|resources|locales|plugins|extensions|drivers|runtime|jre|jdk|jbr|redist|redistributable|edgecore|edgeupdate|cnext|qemu|windows defender|windows media player|windows photo viewer|wsl|common files|epicgameslauncher|microsoft office[^\\]*|battlenet|_components|agunlocker|ai\.opencode\.desktop)(\\|$)'
-$InstallerExeRx = '(?i)(setup|install|installer|unins|uninst|update|updater|redist|vc_redist|dxsetup|directx|dotnet|runtime)'
+$PathJunkRx = '(?i)\\(epic online services|epicgameslauncher|microsoft office[^\\]*|battlenet|_components|agunlocker|ai\.opencode\.desktop|windows defender|windows media player|windows photo viewer|wsl|common files|cnext|edgecore|edgeupdate|clicktorun|dist|build|\.venv|venv|node_modules)(\\|$)'
+$LeafJunkRx = '(?i)^(updater|updaters|update|updates|pending|download|downloads|загрузки|новая папка.*|new folder.*|installer|installers|setup|crashpad|crash|crashreporter|logs?|cache|temp|tmp|backup|backups|old|previous|obsolete|node_modules|__pycache__|site-packages|\.venv|venv|dist|build|obj|target|out|bin|bin64|lib|libs|lib64|include|resources|locales|plugins|extensions|drivers|runtime|jre|jdk|jbr|redist|redistributable|qemu|agent|cli-plugins|platform-tools|emulator|build-tools|sdk)$'
 
 $ContainerRx = '(?i)^([A-Z]:\\|C:\\Program Files|C:\\Program Files \(x86\)|C:\\ProgramData|C:\\Users|C:\\Users\\[^\\]+|C:\\Users\\[^\\]+\\AppData|C:\\Users\\[^\\]+\\AppData\\(Local|Roaming|LocalLow)|C:\\Users\\[^\\]+\\Desktop|C:\\Users\\[^\\]+\\Downloads|C:\\Users\\[^\\]+\\Documents|C:\\Users\\Public|C:\\Users\\All Users)$'
+
+function Select-MainExe($files) {
+    $scored = foreach ($f in $files) {
+        $leafDir = Split-Path -Leaf (Split-Path -Parent $f.Path)
+        $fn = $leafDir -replace '[^a-zA-Z0-9]', ''
+        $en = [IO.Path]::GetFileNameWithoutExtension($f.Path) -replace '[^a-zA-Z0-9]', ''
+        $score = 0
+        if ($en -match '(?i)^(unins|uninst|setup|install|vcredist|vc_redist|update|updater|crash|helper|service|dxsetup)') { $score -= 200 }
+        if ($fn -and $en -and ($fn -like "*$en*" -or $en -like "*$fn*")) { $score += 100 }
+        $vi = $null
+        try { $vi = (Get-Item -LiteralPath $f.Path).VersionInfo } catch {}
+        if ($vi.CompanyName) { $score += 20 }
+        if ($vi.FileDescription -and $vi.FileDescription -notmatch '(?i)uninstall|update|setup|installer|crash|helper|service') { $score += 15 }
+        if ($vi.ProductName -and $vi.ProductName -notmatch '(?i)Windows') { $score += 15 }
+        $score += [math]::Min(20, [int]($f.Size / 1MB))
+        [pscustomobject]@{ File = $f; Score = $score }
+    }
+    $best = $scored | Sort-Object Score -Descending | Select-Object -First 1
+    if ($best) { return $best.File }
+    return $null
+}
 
 function Get-DiskApps($known) {
     Write-Step 'Обход дисков...'
@@ -515,13 +572,13 @@ function Get-DiskApps($known) {
     $out = New-Object System.Collections.ArrayList
 
     $knownDirs = @()
-    $knownNames = @{}
+    $knownNamesNoPath = @{}
     foreach ($k in $known) {
-        if (-not $k.Path) { continue }
-        $p = $k.Path.ToLower()
-        if ($p -match '\\[^\\]+\.[a-z0-9]+$') { $p = (Split-Path -Parent $k.Path).ToLower() }
-        $knownDirs += $p
-        $knownNames[(Get-Norm $k.Name)] = 1
+        if (-not $k.Path) {
+            $knownNamesNoPath[(Get-Norm $k.Name)] = 1
+            continue
+        }
+        $knownDirs += (Get-ContainerPath $k.Path)
     }
 
     $exeByDir = @{}
@@ -540,7 +597,8 @@ function Get-DiskApps($known) {
             if ($parent) { $dir = $parent }
         }
         if (-not $candDirs.ContainsKey($dir)) {
-            $best = $g.Group | Sort-Object Size -Descending | Select-Object -First 1
+            $best = Select-MainExe $g.Group
+            if (-not $best) { $best = $g.Group | Sort-Object Size -Descending | Select-Object -First 1 }
             $candDirs[$dir] = $best.Path
         }
     }
@@ -563,6 +621,14 @@ function Get-DiskApps($known) {
             if (-not $name) { $name = $leaf }
         }
         $name = Get-CleanName $name
+        if ($name -match '^[0-9a-fA-F]{8,}$') {
+            $up1 = Split-Path -Parent $d
+            $up2 = Split-Path -Parent $up1
+            if ((Split-Path -Leaf $up1) -match '(?i)^(bin|bin64|x64|win64)$' -and $up2) {
+                $name = Split-Path -Leaf $up2
+            }
+            else { $name = Split-Path -Leaf $up1 }
+        }
 
         $exesHere = @()
         if ($exeByDir.ContainsKey($dir)) { $exesHere = @($exeByDir[$dir]) }
@@ -595,7 +661,7 @@ function Get-DiskApps($known) {
             Add-Skipped $c.Name $d $c.SizeMB $c.Files 'контейнер (рабочий стол, корень диска, Program Files)'
             continue
         }
-        if ($d -match $JunkDirRx) {
+        if (($d -match $PathJunkRx) -or ($leaf -match $LeafJunkRx)) {
             Add-Skipped $c.Name $d $c.SizeMB $c.Files 'служебная папка (апдейтер, кэш, компонент)'
             continue
         }
@@ -623,7 +689,7 @@ function Get-DiskApps($known) {
             Add-Skipped $c.Name $d $c.SizeMB $c.Files 'уже есть в списке (реестр/Store/Steam)'
             continue
         }
-        if ($knownNames.ContainsKey((Get-Norm $c.Name))) {
+        if ($knownNamesNoPath.ContainsKey((Get-Norm $c.Name))) {
             Add-Skipped $c.Name $d $c.SizeMB $c.Files 'уже есть в списке по имени'
             continue
         }
@@ -683,7 +749,13 @@ function Get-DiskApps($known) {
 }
 
 # ---------------------------------------------------------------- 9. shortcuts
-function Get-ShortcutApps($known) {
+function Get-ContainerPath([string]$path) {
+    if (-not $path) { return '' }
+    if (Test-Path -LiteralPath $path -PathType Leaf) { return (Split-Path -Parent $path).ToLower() }
+    return $path.ToLower()
+}
+
+function Get-ShortcutApps($known, [bool]$diskScanned = $true) {
     Write-Step 'Ярлыки «Пуск» и рабочий стол...'
     $out = New-Object System.Collections.ArrayList
     try { $shell = New-Object -ComObject WScript.Shell } catch { return $out }
@@ -691,8 +763,7 @@ function Get-ShortcutApps($known) {
     $knownDirs = @()
     foreach ($k in $known) {
         if (-not $k.Path) { continue }
-        if ($k.Path -match '\\[^\\]+\.[a-zA-Z0-9]+$') { $knownDirs += (Split-Path -Parent $k.Path).ToLower() }
-        else { $knownDirs += $k.Path.ToLower() }
+        $knownDirs += (Get-ContainerPath $k.Path)
     }
 
     $dirs = @(
@@ -710,7 +781,9 @@ function Get-ShortcutApps($known) {
             if (-not $t -or $t -notmatch '(?i)\.exe$') { return }
             if (-not (Test-Path -LiteralPath $t)) { return }
             if ($t -match '(?i)\\Windows\\|\\System32\\|\\SysWOW64\\|unins|uninstall|setup|update|crash|helper') { return }
-            if ($t -like 'C:\Program Files\*' -or $t -like 'C:\Program Files (x86)\*' -or $t -like "$env:LOCALAPPDATA\Programs\*") { return }
+            if ($t -like 'C:\Program Files\*' -or $t -like 'C:\Program Files (x86)\*' -or $t -like "$env:LOCALAPPDATA\Programs\*") {
+                if ($diskScanned) { return }
+            }
             if ($seen.ContainsKey($t.ToLower())) { return }
             $seen[$t.ToLower()] = 1
 
@@ -769,9 +842,9 @@ function Merge-Apps($apps) {
 }
 
 # ---------------------------------------------------------------- 11. validate
-function Apply-Overrides($apps, [string]$file) {
+function Apply-Overrides($apps, [string]$file, [switch]$OnlyExisting) {
     if (-not $file -or -not (Test-Path $file)) { return $apps }
-    Write-Step "Правки из $([IO.Path]::GetFileName($file))..."
+    if (-not $OnlyExisting) { Write-Step "Правки из $([IO.Path]::GetFileName($file))..." }
     $ov = Import-PowerShellDataFile $file
 
     $map = @{}
@@ -787,14 +860,14 @@ function Apply-Overrides($apps, [string]$file) {
         if ($fix.Version) { $a.Version = $fix.Version }
     }
 
-    if ($ov.Extra) {
+    if ($ov.Extra -and -not $OnlyExisting) {
         foreach ($e in $ov.Extra) {
             if (-not $e.Path -or -not (Test-Path $e.Path)) { continue }
             [void]$apps.Add((New-App -Name $e.Name -Version "$($e.Version)" -Publisher "$($e.Publisher)" -Path $e.Path `
                         -Source 'Override' -Scope 'Пользователь' -Kind 'Портативно'))
         }
     }
-    return $apps
+    return , $apps
 }
 
 function Test-Apps($apps) {
@@ -879,7 +952,8 @@ function Get-ChangeSet($apps, [string]$historyPath) {
         if (-not $hit) { $res.New[$k] = 1; continue }
         $used[$hit.k] = 1
         $verChanged = "$($hit.v)" -ne "$($a.Version)"
-        $sizeChanged = ([math]::Abs([double]$hit.s - [double]$a.SizeMB) -gt 1)
+        $diff = [math]::Abs([double]$hit.s - [double]$a.SizeMB)
+        $sizeChanged = ($diff -gt 10) -and ($diff / [math]::Max(1, [double]$hit.s) -gt 0.05)
         if ($verChanged -or $sizeChanged) { $res.Updated[$k] = 1 }
     }
     $res.Removed = @($prev.items | Where-Object { -not $used.ContainsKey($_.k) })
@@ -1001,6 +1075,7 @@ function Group-Copies($apps) {
     foreach ($a in $apps) {
         $base = $a.Name -replace '\s*\(копия \d+\)\s*$', ''
         $n = Get-Norm $base
+        if ($base -match '^ms-resource') { [void]$out.Add($a); continue }
         if (-not $n) { [void]$out.Add($a); continue }
         if (-not $byName.ContainsKey($n)) {
             $byName[$n] = $a
@@ -1029,12 +1104,18 @@ function Format-Size($mb) {
     return ('{0:N0} МБ' -f $mb)
 }
 
+function Format-Inv($v) {
+    if ($null -eq $v) { return '' }
+    return ([double]$v).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+}
+
 function Export-Report($apps, $skipped, $changes) {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
     $catOrder = @{ 'Приложение' = 0; 'Инструмент' = 1; 'Игра' = 2; 'Store' = 3; 'Системное' = 4 }
     $all = $apps | Sort-Object @{ Expression = { if ($catOrder.ContainsKey($_.Category)) { $catOrder[$_.Category] } else { 9 } } }, Name
 
-    $all | Select-Object Category, Name, Version, Publisher, SizeMB, Files, Path, Copies, OtherPaths, Source, Scope, Kind, Exists, Uninstall,
+    $all | Select-Object Category, Name, Version, Publisher,
+        @{ n = 'SizeMB'; e = { Format-Inv $_.SizeMB } }, Files, Path, Copies, OtherPaths, Source, Scope, Kind, Exists, Uninstall,
         @{ n = 'Change'; e = { $k = (Get-Norm $_.Name) + '|' + "$($_.Path)".ToLower(); if ($changes.New.ContainsKey($k)) { 'новое' } elseif ($changes.Updated.ContainsKey($k)) { 'обновлено' } else { '' } } },
         @{ n = 'LastRun'; e = { if ($_.LastRun) { $_.LastRun.ToString('yyyy-MM-dd HH:mm') } else { '' } } } |
         Export-Csv -Path (Join-Path $OutputDir 'software-inventory.csv') -NoTypeInformation -Encoding UTF8
@@ -1042,14 +1123,19 @@ function Export-Report($apps, $skipped, $changes) {
     if ($changes.HasPrev) {
         $rows = @()
         $rows += $all | Where-Object { $changes.New.ContainsKey((Get-Norm $_.Name) + '|' + "$($_.Path)".ToLower()) } |
-            ForEach-Object { [pscustomobject]@{ Change = 'новое'; Name = $_.Name; Version = $_.Version; SizeMB = $_.SizeMB; Path = $_.Path } }
+            ForEach-Object { [pscustomobject]@{ Change = 'новое'; Name = $_.Name; Version = $_.Version; SizeMB = (Format-Inv $_.SizeMB); Path = $_.Path } }
         $rows += $all | Where-Object { $changes.Updated.ContainsKey((Get-Norm $_.Name) + '|' + "$($_.Path)".ToLower()) } |
-            ForEach-Object { [pscustomobject]@{ Change = 'обновлено'; Name = $_.Name; Version = $_.Version; SizeMB = $_.SizeMB; Path = $_.Path } }
-        $rows += $changes.Removed | ForEach-Object { [pscustomobject]@{ Change = 'пропало'; Name = $_.n; Version = $_.v; SizeMB = $_.s; Path = $_.p } }
+            ForEach-Object { [pscustomobject]@{ Change = 'обновлено'; Name = $_.Name; Version = $_.Version; SizeMB = (Format-Inv $_.SizeMB); Path = $_.Path } }
+        $rows += $changes.Removed | ForEach-Object { [pscustomobject]@{ Change = 'пропало'; Name = $_.n; Version = $_.v; SizeMB = (Format-Inv $_.s); Path = $_.p } }
         $rows | Export-Csv -Path (Join-Path $OutputDir 'changes.csv') -NoTypeInformation -Encoding UTF8
     }
+    else {
+        Remove-Item (Join-Path $OutputDir 'changes.csv') -Force -ErrorAction SilentlyContinue
+    }
 
-    $skipped | Sort-Object Name | Export-Csv -Path (Join-Path $OutputDir 'excluded.csv') -NoTypeInformation -Encoding UTF8
+    $skipped | Sort-Object Name | Select-Object Name, Path,
+        @{ n = 'SizeMB'; e = { Format-Inv $_.SizeMB } }, Files, Reason |
+        Export-Csv -Path (Join-Path $OutputDir 'excluded.csv') -NoTypeInformation -Encoding UTF8
 
     $all | Select-Object Category, Name, Version, Publisher, SizeMB, Files, Path, Source, Scope, Kind, Exists |
         ConvertTo-Json -Depth 3 | Out-File -FilePath (Join-Path $OutputDir 'software-inventory.json') -Encoding UTF8
@@ -1132,7 +1218,8 @@ tr:hover td{background:#141821}
     if ($changes.HasPrev) {
         $chg = " · новых: $($changes.New.Count) · обновлено: $($changes.Updated.Count) · пропало: $($changes.Removed.Count)"
     }
-    [void]$sb.AppendLine("<div class=`"sub`">$hostname · $os · $stamp · показано: <b id=`"total`">$($all.Count)</b> из $($all.Count) · исключено: $($skipped.Count)$chg</div>")
+    $totalGB = if ($all.Count) { [math]::Round((($all | Measure-Object SizeMB -Sum).Sum) / 1024, 1) } else { 0 }
+    [void]$sb.AppendLine("<div class=`"sub`">$hostname · $os · $stamp · показано: <b id=`"total`">$($all.Count)</b> из $($all.Count) · суммарно: $totalGB ГБ · исключено: $($skipped.Count)$chg</div>")
     [void]$sb.AppendLine('<div class="controls"><input type="search" id="q" placeholder="Поиск: название, издатель, путь...">')
     foreach ($cat in @('Приложение', 'Инструмент', 'Игра', 'Store', 'Системное')) {
         $cnt = @($all | Where-Object Category -eq $cat).Count
@@ -1164,16 +1251,17 @@ tr:hover td{background:#141821}
         if ($a.Exists -eq 'нет') { $pathCell = "$pathCell <span class=`"gone`">(папки нет)</span>" }
         elseif ($a.Path -and $a.Path -match '^[A-Za-z]:\\') {
             $target = $a.Path
-            if ($target -match '\\[^\\]+\.[A-Za-z0-9]+$') { $target = Split-Path -Parent $target }
+            if (Test-Path -LiteralPath $target -PathType Leaf) { $target = Split-Path -Parent $target }
             $clean = $target -replace '\\', '/'
-            $href = 'file:///' + [uri]::EscapeUriString($clean)
-            $pathCell = "<a class=`"plink`" href=`"$href`" title=`"Открыть папку`">$pathCell</a>"
+            try { $href = 'file:///' + [uri]::EscapeUriString($clean) } catch { $href = '' }
+            if ($href) { $pathCell = "<a class=`"plink`" href=`"$href`" title=`"Открыть папку`">$pathCell</a>" }
         }
         $sys = if ($a.Category -eq 'Системное') { '1' } else { '0' }
+        $sizeInv = if ($null -ne $a.SizeMB) { ([double]$a.SizeMB).ToString([System.Globalization.CultureInfo]::InvariantCulture) } else { '' }
         $msPub  = $a.Publisher -match '(?i)Microsoft|Майкрософт'
         $msName = $a.Name -match '(?i)^(Microsoft|Windows|WinAppRuntime|ms-resource|Пакет локализованного)'
         $msPath = $a.Path -match '(?i)^C:\\Windows(\\|$)|\\WindowsApps\\Microsoft|^C:\\Program Files\\Microsoft(\\|$)|^C:\\Program Files \(x86\)\\Microsoft(\\|$)'
-        $ms = if ($msPub -or $msName -or $msPath) { '1' } else { '0' }
+        $ms = if ($msPub -or $msName -or $msPath -or ($a.Extra -match '(?i)^(Microsoft|Windows)')) { '1' } else { '0' }
         $run = if ($a.LastRun) { $a.LastRun.ToString('dd.MM.yy') } else { '—' }
         $runV = if ($a.LastRun) { $a.LastRun.ToString('yyyyMMdd') } else { '0' }
         $runCls = if ($a.LastRun) { 'run' } else { 'run never' }
@@ -1181,7 +1269,7 @@ tr:hover td{background:#141821}
             $extraPaths = Esc ($a.OtherPaths -replace '\|', "`n")
             $pathCell = "$pathCell <span class=`"copies`" title=`"ещё путей: $($a.Copies - 1)`n$extraPaths`">+$($a.Copies - 1)</span>"
         }
-        [void]$sb.AppendLine("<tr data-c=`"$($a.Category)`" data-sys=`"$sys`" data-ms=`"$ms`" data-new=`"$isNew`" data-upd=`"$isUpd`" data-run=`"$(if ($a.LastRun) { 1 } else { 0 })`" data-mb=`"$($a.SizeMB)`"><td class=`"n`">$i</td><td class=`"name`" data-v=`"$(Esc $a.Name)`">$(Esc $a.Name)$badge</td><td class=`"ver`" data-v=`"$(Esc $v)`">$(Esc $v)</td><td class=`"pub`" data-v=`"$(Esc $pub)`">$(Esc $pub)</td><td class=`"size`" data-v=`"$($a.SizeMB)`">$(Format-Size $a.SizeMB)</td><td class=`"$runCls`" data-v=`"$runV`" title=`"последний запуск по данным проводника`">$run</td><td class=`"path`" data-v=`"$(Esc $p)`">$pathCell</td><td><span class=`"tag $cls`">$($a.Category)</span></td></tr>")
+        [void]$sb.AppendLine("<tr data-c=`"$($a.Category)`" data-sys=`"$sys`" data-ms=`"$ms`" data-new=`"$isNew`" data-upd=`"$isUpd`" data-run=`"$(if ($a.LastRun) { 1 } else { 0 })`" data-mb=`"$sizeInv`"><td class=`"n`">$i</td><td class=`"name`" data-v=`"$(Esc $a.Name)`">$(Esc $a.Name)$badge</td><td class=`"ver`" data-v=`"$(Esc $v)`">$(Esc $v)</td><td class=`"pub`" data-v=`"$(Esc $pub)`">$(Esc $pub)</td><td class=`"size`" data-v=`"$sizeInv`">$(Format-Size $a.SizeMB)</td><td class=`"$runCls`" data-v=`"$runV`" title=`"последний запуск по данным проводника`">$run</td><td class=`"path`" data-v=`"$(Esc $p)`">$pathCell</td><td><span class=`"tag $cls`">$($a.Category)</span></td></tr>")
     }
     [void]$sb.AppendLine('</tbody></table><div class="empty" id="none" style="display:none">Ничего не найдено</div></main>')
     [void]$sb.AppendLine(@'
@@ -1216,9 +1304,13 @@ function Invoke-Audit($apps, $skipped, [string]$file) {
     $paths = @()
     foreach ($a in $apps) {
         if (-not $a.Path) { continue }
-        $p = $a.Path.ToLower()
-        if ($p -match '\\[^\\]+\.[a-z0-9]+$') { $p = (Split-Path -Parent $a.Path).ToLower() }
-        $paths += $p
+        $paths += (Get-ContainerPath $a.Path)
+        if ($a.OtherPaths) {
+            foreach ($op in ($a.OtherPaths -split '\|')) {
+                $op = $op.Trim()
+                if ($op) { $paths += (Get-ContainerPath $op) }
+            }
+        }
     }
     $idx = Get-DiskIndex
     $lines = @()
@@ -1229,7 +1321,9 @@ function Invoke-Audit($apps, $skipped, [string]$file) {
         if ($hit) { continue }
         $knownSkip = $skipped | Where-Object { $_.Path -and $_.Path.ToLower() -eq $d }
         $reason = if ($knownSkip) { ($knownSkip | Select-Object -First 1).Reason } else { 'не классифицировано' }
-        $lines += ('{0,9:N1} МБ  {1}  [{2}]' -f [math]::Round($idx.Sizes[$g.Name] / 1MB, 1), $g.Name, $reason)
+        $sz = $idx.Sizes[$g.Name]
+        if (-not $sz) { $sz = 0 }
+        $lines += ('{0,9:N1} МБ  {1}  [{2}]' -f [math]::Round($sz / 1MB, 1), $g.Name, $reason)
     }
     $lines = $lines | Sort-Object -Unique
     $lines | Out-File -FilePath $file -Encoding UTF8
@@ -1241,7 +1335,12 @@ $script:Skipped = New-Object System.Collections.ArrayList
 $apps = New-Object System.Collections.ArrayList
 
 Write-Host 'Сбор данных...' -ForegroundColor Cyan
+if (-not $OverridesPath) { $OverridesPath = Join-Path $PSScriptRoot 'overrides.psd1' }
+
 foreach ($a in (Get-RegistryApps)) { [void]$apps.Add($a) }
+# пути из overrides нужны до обхода диска, иначе получим дубли
+$apps = Apply-Overrides $apps $OverridesPath -OnlyExisting
+
 if (-not $NoStore) { foreach ($a in (Get-StoreApps)) { [void]$apps.Add($a) } }
 if (-not $NoGames) {
     foreach ($a in (Get-SteamApps)) { [void]$apps.Add($a) }
@@ -1254,13 +1353,15 @@ foreach ($a in (Get-ToolchainApps)) { [void]$apps.Add($a) }
 
 if (-not $NoPortable) {
     foreach ($a in (Get-DiskApps $apps)) { [void]$apps.Add($a) }
-    if (-not $SkipShortcuts) { foreach ($a in (Get-ShortcutApps $apps)) { [void]$apps.Add($a) } }
+}
+if (-not $SkipShortcuts) {
+    foreach ($a in (Get-ShortcutApps $apps (-not $NoPortable))) { [void]$apps.Add($a) }
 }
 
 Write-Step 'Склейка дублей...'
 $apps = Merge-Apps $apps
+if ($NoGames) { $apps = @($apps | Where-Object { $_.Category -ne 'Игра' }) }
 
-if (-not $OverridesPath) { $OverridesPath = Join-Path $PSScriptRoot 'overrides.psd1' }
 $apps = Apply-Overrides $apps $OverridesPath
 $apps = Test-Apps $apps
 $apps = Add-Usage $apps

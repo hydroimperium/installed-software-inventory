@@ -47,7 +47,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Get-InstalledSoftware.ps1
 | `-MinPortableSizeMB` | `3` | Минимальный размер portable-программы |
 | `-IncludeSystem` | выкл. | Показать служебное ПО сразу, без фильтра |
 | `-NoStore` | — | Не собирать Microsoft Store |
-| `-NoGames` | — | Не собирать игры |
+| `-NoGames` | — | Не собирать игры — ни из лаунчеров, ни с диска |
 | `-NoPortable` | — | Не обходить диски (только реестр, Store, Steam/Epic/GOG, Scoop, WSL) |
 | `-ExtraRoots` | — | Дополнительные папки для поиска |
 | `-OverridesPath` | `.\overrides.psd1` | Файл ручных правок |
