@@ -367,6 +367,9 @@ function Get-ScoopApps {
 function Get-WslApps {
     Write-Step 'WSL...'
     $out = New-Object System.Collections.ArrayList
+    # без зарегистрированных дистрибутивов wsl.exe на некоторых машинах запускает установщик и висит
+    if (-not (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss')) { return $out }
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue)) { return $out }
     $raw = & wsl.exe -l -q 2>$null
     if (-not $raw) { return $out }
     foreach ($line in $raw) {
