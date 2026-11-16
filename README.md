@@ -1,6 +1,10 @@
 # installed-software-inventory
 
+[![CI](https://github.com/hydroimperium/installed-software-inventory/actions/workflows/ci.yml/badge.svg)](https://github.com/hydroimperium/installed-software-inventory/actions/workflows/ci.yml)
+
 Скрипт для Windows, который собирает полный список установленного ПО: обычные программы, portable, Microsoft Store, Steam/Epic/GOG, Scoop, WSL и SDK. На выходе — интерактивный HTML-отчёт с поиском и фильтрами, CSV, Markdown и JSON.
+
+Версия: `1.0.0` (`.\Get-InstalledSoftware.ps1 -Version`).
 
 Главное отличие от «просто перечислить реестр»: скрипт обходит диски целиком, группирует все `.exe` по папкам и проверяет каждую папку — существует ли, сколько весит, сколько файлов. Пустые и почти пустые папки, апдейтеры, кэши, junction-дубли и дампы установщиков отбрасываются и попадают в `reports/excluded.csv` с причиной. Ничего не теряется молча.
 
@@ -53,6 +57,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Get-InstalledSoftware.ps1
 | `-OverridesPath` | `.\overrides.psd1` | Файл ручных правок |
 | `-SkipShortcuts` | — | Не разбирать ярлыки «Пуск» и рабочего стола |
 | `-Audit` | — | Показать папки с exe, которые не попали в отчёт |
+| `-Strict` | — | Код выхода 2, если хотя бы один источник упал |
+| `-Version` | — | Показать версию и выйти |
 | `-Open` | — | Открыть HTML после сборки |
 
 Примеры:
@@ -136,6 +142,35 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Get-InstalledSoftware.ps1
 | `changes.csv` | Новые, обновлённые и пропавшие программы (со второго запуска) |
 | `history.json` | Снимок прошлого запуска для сравнения |
 | `audit.txt` | То же, компактно (при `-Audit`) |
+
+## Структура проекта
+
+```
+Get-InstalledSoftware.ps1   точка входа, параметры, оркестрация
+lib\Core.ps1                чистые функции: имена, категории, склейка, форматирование
+tests\run-tests.ps1         37 юнит-тестов + смоук (-IncludeSmoke)
+run.cmd                     запуск двойным кликом
+```
+
+## Тесты
+
+```powershell
+# юнит-тесты
+.\tests\run-tests.ps1
+
+# плюс полный прогон на реальной машине
+.\tests\run-tests.ps1 -IncludeSmoke
+```
+
+Тесты без внешних зависимостей: работают в Windows PowerShell 5.1 и PowerShell 7. CI гоняет их на каждый push.
+
+## Коды выхода
+
+| Код | Значение |
+|---|---|
+| `0` | Успех |
+| `1` | Фатальная ошибка (нет доступа к диску, отчёт не записан) |
+| `2` | Часть источников упала, но отчёт собран (только с `-Strict`) |
 
 ## Ограничения
 

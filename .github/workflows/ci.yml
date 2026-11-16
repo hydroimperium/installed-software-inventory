@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Синтаксис
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'Get-InstalledSoftware.ps1'), [ref]$tokens, [ref]$errors)
+          if ($errors.Count) {
+            $errors | ForEach-Object { Write-Host $_.Message }
+            exit 1
+          }
+          Write-Host 'syntax OK'
+
+      - name: Тесты
+        shell: pwsh
+        run: ./tests/run-tests.ps1
+
+      - name: Смоук-прогон
+        shell: pwsh
+        run: ./tests/run-tests.ps1 -IncludeSmoke

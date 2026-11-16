@@ -71,11 +71,23 @@ param(
     [switch]$SkipShortcuts,
     [switch]$Audit,
     [switch]$Open,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$Strict,
+    [switch]$Version
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
+
+$script:AppVersion = '1.0.0'
+$script:SourceErrors = New-Object System.Collections.ArrayList
+
+if ($Version) {
+    Write-Output "installed-software-inventory $($script:AppVersion)"
+    exit 0
+}
+
+. (Join-Path $PSScriptRoot 'lib\Core.ps1')
 
 if (-not $OutputDir) { $OutputDir = Join-Path $PSScriptRoot 'reports' }
 $null = New-Item -ItemType Directory -Force -Path $OutputDir
@@ -85,23 +97,9 @@ function Write-Step([string]$text) {
 }
 
 # ---------------------------------------------------------------- helpers
-function Get-Norm([string]$s) {
-    if (-not $s) { return '' }
-    return ($s -replace '[^\p{L}\p{N}]', '').ToLowerInvariant()
-}
 
-function Get-CleanName([string]$name) {
-    if (-not $name) { return '' }
-    $n = $name.Trim()
-    $n = $n -replace '\s*[\[\(](RePack|Repack|GOG|Portable|Rip)[\]\)]\s*$', ''
-    $n = $n -replace "[\u2018\u2019]", "'"
-    $n = $n -replace '^(.+?)[,\s]+версия\s+[\d\.\+\w\-]+$', '$1'
-    $n = $n -replace '^(.+?)\s+version\s+[\d\.\+\w\-]+$', '$1'
-    $n = $n -replace '\s+\((User|x64|x86|64-bit|32-bit)\)\s*$', ''
-    $n = $n -replace '\s+for\s+\S+$', ''
-    $n = $n -replace '^Sid Meiers ', "Sid Meier's "
-    return $n.Trim()
-}
+
+
 
 $script:StatsCache = @{}
 function Get-FolderStats([string]$path) {
@@ -147,50 +145,10 @@ function Test-AppFolder([string]$path, [double]$minMB, [int]$minFiles, [string]$
     return $true
 }
 
-$SystemRx = '(?i)Visual C\+\+|\.NET (SDK|Runtime|Desktop Runtime)|Windows Desktop Runtime|Windows SDK|DirectX|Edge WebView2|Edge Update|Epic Online Services|Mozilla Maintenance|AMD[ _](Chipset|Install)|Realtek Card Reader|EpsonNet|Драйвер принтера|Application Compatibility|Application Virtualization|Windows Subsystem for Linux|^WSL|WinAppRuntime|ShellExtension|ContextMenu|SparseApp|Winget\.Source|DesktopAppInstaller|StorePurchaseApp|LanguageExperiencePack|VCLibs|Microsoft\.UI\.Xaml|HostRuntime|AppRuntime|PlatformRuntime|Windows App Runtime|Windows Media Player|Windows Photo Viewer|Windows Defender|Microsoft Office$|Razer S3|Razer.*Wizard'
-$ToolRx   = '(?i)Visual Studio Code|Android Studio|Android SDK|IntelliJ|PyCharm|WebStorm|^Git$|GitHub CLI|Node\.js|Python|OpenJDK|Temurin|JDK|Docker|Postman|Scoop|Maestro|Cursor|Devin|Antigravity|OpenCode|DeepSeek|Codex|Blender|Godot|NekoBox|LockHunter|WinRAR|7-Zip|PowerToys|zapret|Ubuntu|Bun$|Chocolatey|spicetify'
-$GamePathRx = '(?i)steamapps\\common|\\Games\\|\\torrent\\|GOG Games'
 
-function Get-Category([string]$name, [string]$path, [string]$source, [string]$kind) {
-    if ($kind -eq 'Игра') { return 'Игра' }
-    if ($source -in @('Steam', 'Epic', 'GOG')) { return 'Игра' }
-    if ($path -and $path -match $GamePathRx) { return 'Игра' }
-    if ($source -eq 'WSL') { return 'Инструмент' }
-    if ($source -eq 'Microsoft Store') {
-        if ($name -match $SystemRx) { return 'Системное' }
-        return 'Store'
-    }
-    if ($name -match $SystemRx) { return 'Системное' }
-    if ($name -match $ToolRx) { return 'Инструмент' }
-    return 'Приложение'
-}
 
-function New-App {
-    param(
-        [string]$Name, [string]$Version, [string]$Publisher, [string]$Path,
-        [string]$Source, [string]$Scope = '', [string]$Uninstall = '', [string]$Kind = 'Установлено'
-    )
-    $clean = Get-CleanName $Name
-    if (-not $clean) { $clean = $Name }
-    [pscustomobject]@{
-        Name      = $clean
-        Version   = "$Version".Trim()
-        Publisher = "$Publisher".Trim()
-        Path      = if ($Path) { $pp = ($Path -replace '/', '\').TrimEnd('\'); if ($pp -match '^[a-z]:') { $pp = $pp.Substring(0, 1).ToUpper() + $pp.Substring(1) }; $pp } else { '' }
-        Category  = (Get-Category $clean $Path $Source $Kind)
-        Source    = $Source
-        Scope     = $Scope
-        Kind      = $Kind
-        Uninstall = $Uninstall
-        SizeMB    = $null
-        Files     = $null
-        Exists    = ''
-        LastRun   = $null
-        Copies    = 1
-        OtherPaths = ''
-        Extra     = ''
-    }
-}
+
+
 
 # ---------------------------------------------------------------- 1. registry
 function Get-RegistryApps {
@@ -293,10 +251,13 @@ function Get-SteamApps {
     $out = New-Object System.Collections.ArrayList
     $roots = @()
     foreach ($base in @('C:\Program Files (x86)\Steam', 'C:\Program Files\Steam', 'D:\steam', 'D:\Steam', 'E:\steam')) {
+        if (-not (Test-Path -LiteralPath $base)) { continue }
         if (Test-Path (Join-Path $base 'steamapps')) { $roots += $base }
     }
     $steamReg = Get-ItemProperty 'HKCU:\Software\Valve\Steam' -ErrorAction SilentlyContinue
-    if ($steamReg.SteamPath -and (Test-Path (Join-Path $steamReg.SteamPath 'steamapps'))) { $roots += $steamReg.SteamPath }
+    if ($steamReg -and $steamReg.SteamPath -and (Test-Path -LiteralPath $steamReg.SteamPath)) {
+        if (Test-Path (Join-Path $steamReg.SteamPath 'steamapps')) { $roots += $steamReg.SteamPath }
+    }
 
     $roots = $roots | ForEach-Object { $_.TrimEnd('\') } | Sort-Object -Unique
     if (-not $roots) { return $out }
@@ -749,11 +710,7 @@ function Get-DiskApps($known) {
 }
 
 # ---------------------------------------------------------------- 9. shortcuts
-function Get-ContainerPath([string]$path) {
-    if (-not $path) { return '' }
-    if (Test-Path -LiteralPath $path -PathType Leaf) { return (Split-Path -Parent $path).ToLower() }
-    return $path.ToLower()
-}
+
 
 function Get-ShortcutApps($known, [bool]$diskScanned = $true) {
     Write-Step 'Ярлыки «Пуск» и рабочий стол...'
@@ -805,41 +762,7 @@ function Get-ShortcutApps($known, [bool]$diskScanned = $true) {
 }
 
 # ---------------------------------------------------------------- 10. merge
-function Merge-Apps($apps) {
-    $prio = @{ 'Steam' = 0; 'Epic' = 0; 'GOG' = 0; 'Реестр' = 1; 'Toolchain' = 1; 'Microsoft Store' = 2; 'Scoop' = 3; 'Диск' = 4; 'Ярлык' = 5 }
-    $sorted = $apps | Sort-Object @{ Expression = { if ($prio.ContainsKey($_.Source)) { $prio[$_.Source] } else { 9 } } }
 
-    $result = New-Object System.Collections.ArrayList
-    $byName = @{}
-    $byPath = @{}
-    $dupCount = @{}
-
-    foreach ($a in $sorted) {
-        $n = Get-Norm $a.Name
-        $p = "$($a.Path)".ToLower()
-
-        if ($byName.ContainsKey("$n|$p")) { continue }
-
-        $dup = $false
-        if ($n -and $byName.ContainsKey($n)) {
-            $prev = $byName[$n]
-            if (-not $p -or -not $prev.Path -or $p -eq $prev.Path.ToLower() -or
-                $p.StartsWith($prev.Path.ToLower() + '\') -or $prev.Path.ToLower().StartsWith($p + '\')) { $dup = $true }
-        }
-        if ($dup) { continue }
-        if ($p -and $byPath.ContainsKey($p)) { continue }
-
-        if ($n -and $byName.ContainsKey($n)) {
-            $dupCount[$n] = 1 + $(if ($dupCount.ContainsKey($n)) { $dupCount[$n] } else { 0 })
-            $a.Name = "$($a.Name) (копия $($dupCount[$n]))"
-        }
-
-        [void]$result.Add($a)
-        if ($n) { $byName[$n] = $a }
-        if ($p) { $byPath[$p] = $a }
-    }
-    return $result
-}
 
 # ---------------------------------------------------------------- 11. validate
 function Apply-Overrides($apps, [string]$file, [switch]$OnlyExisting) {
@@ -975,15 +898,7 @@ function Save-Snapshot($apps, [string]$historyPath) {
 }
 
 # ---------------------------------------------------------------- 11c. usage
-function Rot13([string]$s) {
-    $chars = $s.ToCharArray()
-    for ($i = 0; $i -lt $chars.Length; $i++) {
-        $c = $chars[$i]
-        if ($c -ge 'a' -and $c -le 'z') { $chars[$i] = [char]((([int]$c - 97 + 13) % 26) + 97) }
-        elseif ($c -ge 'A' -and $c -le 'Z') { $chars[$i] = [char]((([int]$c - 65 + 13) % 26) + 65) }
-    }
-    return -join $chars
-}
+
 
 function Get-UsageIndex {
     $res = New-Object System.Collections.ArrayList
@@ -1047,6 +962,7 @@ function Add-Usage($apps) {
         if (-not $best) {
             $leaf = Split-Path -Leaf $a.Path
             foreach ($u in $usage) {
+                if (-not $u.Path) { continue }
                 if ((Split-Path -Leaf $u.Path) -ieq $leaf) { if (-not $best -or $u.Last -gt $best) { $best = $u.Last } }
             }
         }
@@ -1068,46 +984,13 @@ function Add-Usage($apps) {
 }
 
 # ---------------------------------------------------------------- 11d. copies
-function Group-Copies($apps) {
-    Write-Step 'Группировка копий...'
-    $byName = @{}
-    $out = New-Object System.Collections.ArrayList
-    foreach ($a in $apps) {
-        $base = $a.Name -replace '\s*\(копия \d+\)\s*$', ''
-        $n = Get-Norm $base
-        if ($base -match '^ms-resource') { [void]$out.Add($a); continue }
-        if (-not $n) { [void]$out.Add($a); continue }
-        if (-not $byName.ContainsKey($n)) {
-            $byName[$n] = $a
-            [void]$out.Add($a)
-            continue
-        }
-        $primary = $byName[$n]
-        # копией считаем только тот же продукт: совпадает категория или источник
-        $primary.Copies++
-        if ($a.Path) {
-            $primary.OtherPaths = if ($primary.OtherPaths) { "$($primary.OtherPaths) | $($a.Path)" } else { $a.Path }
-        }
-        if ($a.SizeMB -and $primary.SizeMB) { $primary.SizeMB = $primary.SizeMB + $a.SizeMB }
-        elseif ($a.SizeMB) { $primary.SizeMB = $a.SizeMB }
-        if ($a.LastRun -and (-not $primary.LastRun -or $a.LastRun -gt $primary.LastRun)) { $primary.LastRun = $a.LastRun }
-    }
-    return $out
-}
+
 
 # ---------------------------------------------------------------- 12. report
-function Esc([string]$s) { if (-not $s) { return '' }; return [System.Net.WebUtility]::HtmlEncode($s) }
 
-function Format-Size($mb) {
-    if ($null -eq $mb -or $mb -le 0) { return '—' }
-    if ($mb -ge 1024) { return ('{0:N1} ГБ' -f ($mb / 1024)) }
-    return ('{0:N0} МБ' -f $mb)
-}
 
-function Format-Inv($v) {
-    if ($null -eq $v) { return '' }
-    return ([double]$v).ToString([System.Globalization.CultureInfo]::InvariantCulture)
-}
+
+
 
 function Export-Report($apps, $skipped, $changes) {
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
@@ -1207,6 +1090,13 @@ tr:hover td{background:#141821}
 .run{color:#9fb3d1;font-variant-numeric:tabular-nums;white-space:nowrap}
 .run.never{color:#5f6675}
 .copies{display:inline-block;margin-left:6px;padding:0 6px;border-radius:8px;background:#22304a;color:#7fb3ff;font-size:11px;font-weight:600;cursor:help}
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 4px}
+.card{display:flex;flex-direction:column;gap:2px;min-width:120px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--txt);text-align:left;cursor:pointer;font:inherit}
+.card:hover,.card:focus-visible{border-color:var(--acc);outline:none}
+.card-name{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.card-count{font-size:20px;font-weight:600;line-height:1.1}
+.card-size{font-size:12px;color:#9fe0b0}
+@media print{header{position:static}.controls,.cards,.copies{display:none}body{background:#fff;color:#000}td,th{border-color:#ccc}.path{color:#333}}
 .empty{padding:40px;text-align:center;color:var(--dim)}
 @media(max-width:900px){header,main{padding-left:14px;padding-right:14px}th:nth-child(3),td:nth-child(3){display:none}}
 '@)
@@ -1219,8 +1109,8 @@ tr:hover td{background:#141821}
         $chg = " · новых: $($changes.New.Count) · обновлено: $($changes.Updated.Count) · пропало: $($changes.Removed.Count)"
     }
     $totalGB = if ($all.Count) { [math]::Round((($all | Measure-Object SizeMB -Sum).Sum) / 1024, 1) } else { 0 }
-    [void]$sb.AppendLine("<div class=`"sub`">$hostname · $os · $stamp · показано: <b id=`"total`">$($all.Count)</b> из $($all.Count) · суммарно: $totalGB ГБ · исключено: $($skipped.Count)$chg</div>")
-    [void]$sb.AppendLine('<div class="controls"><input type="search" id="q" placeholder="Поиск: название, издатель, путь...">')
+    [void]$sb.AppendLine("<div class=`"sub`">$hostname · $os · $stamp · записей: <b id=`"shown`">$($all.Count)</b> из $($all.Count) · суммарно: <b id=`"sum`">$totalGB</b> ГБ · отброшено: $($skipped.Count)$chg</div>")
+    [void]$sb.AppendLine('<div class="controls"><input type="search" id="q" aria-label="Поиск" placeholder="Поиск: название, издатель, путь...">')
     foreach ($cat in @('Приложение', 'Инструмент', 'Игра', 'Store', 'Системное')) {
         $cnt = @($all | Where-Object Category -eq $cat).Count
         if ($cnt -gt 0) { [void]$sb.AppendLine("<div class=`"chip on`" data-c=`"$cat`">$cat<b>$cnt</b></div>") }
@@ -1231,7 +1121,16 @@ tr:hover td{background:#141821}
     if ($changes.HasPrev) {
         [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"onlyNew`"> только изменения</label>")
     }
-    [void]$sb.AppendLine('</div></header><main><table id="t"><thead><tr><th class="n">#</th><th data-s="name">Название</th><th data-s="ver">Версия</th><th data-s="pub">Издатель</th><th data-s="size">Размер</th><th data-s="run">Запуск</th><th data-s="path">Путь</th><th data-s="cat">Категория</th></tr></thead><tbody>')
+    [void]$sb.AppendLine('</div></header><main>')
+    [void]$sb.AppendLine('<div class="cards" role="group" aria-label="Категории">')
+    foreach ($cat in @('Приложение', 'Инструмент', 'Игра', 'Store', 'Системное')) {
+        $items = @($all | Where-Object Category -eq $cat)
+        if (-not $items.Count) { continue }
+        $catGB = [math]::Round((($items | Measure-Object SizeMB -Sum).Sum) / 1024, 1)
+        [void]$sb.AppendLine("<button type=`"button`" class=`"card`" data-c=`"$cat`"><span class=`"card-name`">$cat</span><span class=`"card-count`">$($items.Count)</span><span class=`"card-size`">$catGB ГБ</span></button>")
+    }
+    [void]$sb.AppendLine('</div>')
+    [void]$sb.AppendLine('<table id="t"><thead><tr><th class="n">#</th><th data-s="name">Название</th><th data-s="ver">Версия</th><th data-s="pub">Издатель</th><th data-s="size">Размер</th><th data-s="run">Запуск</th><th data-s="path">Путь</th><th data-s="cat">Категория</th></tr></thead><tbody>')
 
     $i = 0
     foreach ($a in $all) {
@@ -1277,16 +1176,19 @@ tr:hover td{background:#141821}
 const q=document.getElementById('q'),rows=[...document.querySelectorAll('#t tbody tr')],none=document.getElementById('none');
 const chips=[...document.querySelectorAll('.chip')],hideSys=document.getElementById('hideSys'),hideMs=document.getElementById('hideMs'),onlyNew=document.getElementById('onlyNew'),onlyUnused=document.getElementById('onlyUnused');
 let active=new Set(chips.filter(c=>c.classList.contains('on')).map(c=>c.dataset.c));
-function apply(){const s=q.value.toLowerCase().trim();let n=0;
+function apply(){const s=q.value.toLowerCase().trim();let n=0,mb=0;
  rows.forEach(r=>{const okC=active.has(r.dataset.c);const okS=!s||r.textContent.toLowerCase().includes(s);
   const okY=!(hideSys.checked&&r.dataset.sys==='1');
   const okM=!(hideMs&&hideMs.checked&&(r.dataset.ms==='1'||r.dataset.sys==='1')&&r.dataset.run==='0');
   const okN=!(onlyNew&&onlyNew.checked&&r.dataset.new!=='1'&&r.dataset.upd!=='1');
   const okU=!(onlyUnused&&onlyUnused.checked&&r.dataset.run!=='0');
-  const show=okC&&okS&&okY&&okM&&okN&&okU;r.style.display=show?'':'none';if(show)n++;});
- none.style.display=n?'none':'block';document.getElementById('total').textContent=n;}
+  const show=okC&&okS&&okY&&okM&&okN&&okU;r.style.display=show?'':'none';if(show){n++;mb+=parseFloat(r.dataset.mb)||0;}});
+ none.style.display=n?'none':'block';
+ document.getElementById('shown').textContent=n;
+ document.getElementById('sum').textContent=(mb/1024).toFixed(1);}
 q.addEventListener('input',apply);hideSys.addEventListener('change',apply);if(hideMs)hideMs.addEventListener('change',apply);if(onlyNew)onlyNew.addEventListener('change',apply);if(onlyUnused)onlyUnused.addEventListener('change',apply);
 chips.forEach(c=>c.addEventListener('click',()=>{const k=c.dataset.c;if(active.has(k)){active.delete(k);c.classList.remove('on')}else{active.add(k);c.classList.add('on')}apply();}));
+document.querySelectorAll('.card').forEach(card=>card.addEventListener('click',()=>{const chip=document.querySelector('.chip[data-c="'+card.dataset.c+'"]');if(chip)chip.click();}));
 document.querySelectorAll('th[data-s]').forEach(th=>{let asc=true;th.addEventListener('click',()=>{const tb=document.querySelector('#t tbody');const rs=[...tb.rows];const idx=[...th.parentNode.children].indexOf(th);
  rs.sort((a,b)=>{const x=a.cells[idx].dataset.v||a.cells[idx].textContent,y=b.cells[idx].dataset.v||b.cells[idx].textContent;return x.localeCompare(y,'ru',{numeric:true})*(asc?1:-1)});
  asc=!asc;rs.forEach(r=>tb.appendChild(r));});});
@@ -1332,69 +1234,96 @@ function Invoke-Audit($apps, $skipped, [string]$file) {
 
 # ---------------------------------------------------------------- main
 $script:Skipped = New-Object System.Collections.ArrayList
-$apps = New-Object System.Collections.ArrayList
+$script:Apps = New-Object System.Collections.ArrayList
 
-Write-Host 'Сбор данных...' -ForegroundColor Cyan
-if (-not $OverridesPath) { $OverridesPath = Join-Path $PSScriptRoot 'overrides.psd1' }
-
-foreach ($a in (Get-RegistryApps)) { [void]$apps.Add($a) }
-# пути из overrides нужны до обхода диска, иначе получим дубли
-$apps = Apply-Overrides $apps $OverridesPath -OnlyExisting
-
-if (-not $NoStore) { foreach ($a in (Get-StoreApps)) { [void]$apps.Add($a) } }
-if (-not $NoGames) {
-    foreach ($a in (Get-SteamApps)) { [void]$apps.Add($a) }
-    foreach ($a in (Get-EpicApps)) { [void]$apps.Add($a) }
-    foreach ($a in (Get-GOGApps)) { [void]$apps.Add($a) }
-}
-foreach ($a in (Get-ScoopApps)) { [void]$apps.Add($a) }
-foreach ($a in (Get-WslApps)) { [void]$apps.Add($a) }
-foreach ($a in (Get-ToolchainApps)) { [void]$apps.Add($a) }
-
-if (-not $NoPortable) {
-    foreach ($a in (Get-DiskApps $apps)) { [void]$apps.Add($a) }
-}
-if (-not $SkipShortcuts) {
-    foreach ($a in (Get-ShortcutApps $apps (-not $NoPortable))) { [void]$apps.Add($a) }
+function Add-FromSource([string]$name, [scriptblock]$source) {
+    try {
+        $items = & $source
+        foreach ($a in $items) { if ($a) { [void]$script:Apps.Add($a) } }
+    }
+    catch {
+        $msg = $_.Exception.Message
+        [void]$script:SourceErrors.Add([pscustomobject]@{ Source = $name; Message = $msg })
+        Write-Host ("  [!] {0}: {1}" -f $name, $msg) -ForegroundColor Yellow
+        if ($env:ISI_DEBUG) { Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray }
+    }
 }
 
-Write-Step 'Склейка дублей...'
-$apps = Merge-Apps $apps
-if ($NoGames) { $apps = @($apps | Where-Object { $_.Category -ne 'Игра' }) }
+try {
+    Write-Host ("Сбор данных (v{0})..." -f $script:AppVersion) -ForegroundColor Cyan
+    if (-not $OverridesPath) { $OverridesPath = Join-Path $PSScriptRoot 'overrides.psd1' }
 
-$apps = Apply-Overrides $apps $OverridesPath
-$apps = Test-Apps $apps
-$apps = Add-Usage $apps
-$apps = Group-Copies $apps
+    Add-FromSource 'Реестр' { Get-RegistryApps }
+    # пути из overrides нужны до обхода диска, иначе получим дубли
+    $script:Apps = Apply-Overrides $script:Apps $OverridesPath -OnlyExisting
 
-$historyPath = Join-Path $OutputDir 'history.json'
-$changes = Get-ChangeSet $apps $historyPath
+    if (-not $NoStore) { Add-FromSource 'Microsoft Store' { Get-StoreApps } }
+    if (-not $NoGames) {
+        Add-FromSource 'Steam' { Get-SteamApps }
+        Add-FromSource 'Epic Games' { Get-EpicApps }
+        Add-FromSource 'GOG' { Get-GOGApps }
+    }
+    Add-FromSource 'Scoop' { Get-ScoopApps }
+    Add-FromSource 'WSL' { Get-WslApps }
+    Add-FromSource 'SDK' { Get-ToolchainApps }
 
-$html = Export-Report $apps $script:Skipped $changes
-Save-Snapshot $apps $historyPath
+    if (-not $NoPortable) { Add-FromSource 'Диск' { Get-DiskApps $script:Apps } }
+    if (-not $SkipShortcuts) { Add-FromSource 'Ярлыки' { Get-ShortcutApps $script:Apps (-not $NoPortable) } }
 
-if ($Audit) {
-    $auditLines = Invoke-Audit $apps $script:Skipped (Join-Path $OutputDir 'audit.txt')
+    Write-Step 'Склейка дублей...'
+    $apps = Merge-Apps $script:Apps
+    if ($NoGames) { $apps = @($apps | Where-Object { $_.Category -ne 'Игра' }) }
+
+    $apps = Apply-Overrides $apps $OverridesPath
+    $apps = Test-Apps $apps
+    $apps = Add-Usage $apps
+    Write-Step 'Группировка копий...'
+    $apps = Group-Copies $apps
+
+    $historyPath = Join-Path $OutputDir 'history.json'
+    $changes = Get-ChangeSet $apps $historyPath
+
+    $html = Export-Report $apps $script:Skipped $changes
+    Save-Snapshot $apps $historyPath
+
+    if ($Audit) {
+        $auditLines = Invoke-Audit $apps $script:Skipped (Join-Path $OutputDir 'audit.txt')
+        Write-Host ''
+        if ($auditLines.Count) {
+            Write-Host "Не покрыто отчётом: $($auditLines.Count)" -ForegroundColor Yellow
+            $auditLines | Select-Object -First 25 | ForEach-Object { Write-Host "  $_" }
+            Write-Host "  ...полный список: $OutputDir\audit.txt" -ForegroundColor DarkGray
+        }
+        else {
+            Write-Host 'Аудит: каждая папка с exe либо в отчёте, либо в excluded.csv.' -ForegroundColor Green
+        }
+    }
+
     Write-Host ''
-    if ($auditLines.Count) {
-        Write-Host "Не покрыто отчётом: $($auditLines.Count)" -ForegroundColor Yellow
-        $auditLines | Select-Object -First 25 | ForEach-Object { Write-Host "  $_" }
-        Write-Host "  ...полный список: $OutputDir\audit.txt" -ForegroundColor DarkGray
+    Write-Host 'Готово.' -ForegroundColor Green
+    foreach ($g in ($apps | Group-Object Category | Sort-Object Name)) { Write-Host ("  {0,-12} {1}" -f $g.Name, $g.Count) }
+    Write-Host ("  Всего:       {0}" -f $apps.Count)
+    if ($script:Skipped.Count) { Write-Host ("  Исключено:   {0} (см. excluded.csv)" -f $script:Skipped.Count) -ForegroundColor DarkYellow }
+    if ($changes.HasPrev) {
+        Write-Host ("  Новых: {0} · обновлено: {1} · пропало: {2} (changes.csv)" -f $changes.New.Count, $changes.Updated.Count, $changes.Removed.Count) -ForegroundColor Cyan
     }
-    else {
-        Write-Host 'Аудит: каждая папка с exe либо в отчёте, либо в excluded.csv.' -ForegroundColor Green
-    }
+    Write-Host ''
+    Write-Host "Отчёты: $OutputDir" -ForegroundColor Cyan
+
+    if ($Open) { Start-Process $html }
+}
+catch {
+    Write-Host ''
+    Write-Host ("Ошибка: " + $_.Exception.Message) -ForegroundColor Red
+    Write-Host ($_.ScriptStackTrace) -ForegroundColor DarkGray
+    exit 1
 }
 
-Write-Host ''
-Write-Host 'Готово.' -ForegroundColor Green
-foreach ($g in ($apps | Group-Object Category | Sort-Object Name)) { Write-Host ("  {0,-12} {1}" -f $g.Name, $g.Count) }
-Write-Host ("  Всего:       {0}" -f $apps.Count)
-if ($script:Skipped.Count) { Write-Host ("  Исключено:   {0} (см. excluded.csv)" -f $script:Skipped.Count) -ForegroundColor DarkYellow }
-if ($changes.HasPrev) {
-    Write-Host ("  Новых: {0} · обновлено: {1} · пропало: {2} (changes.csv)" -f $changes.New.Count, $changes.Updated.Count, $changes.Removed.Count) -ForegroundColor Cyan
+if ($script:SourceErrors.Count) {
+    Write-Host ''
+    Write-Host ("Источники с ошибками: " + $script:SourceErrors.Count) -ForegroundColor Yellow
+    foreach ($e in $script:SourceErrors) { Write-Host ("  - " + $e.Source + ": " + $e.Message) -ForegroundColor DarkYellow }
+    if ($Strict) { exit 2 }
 }
-Write-Host ''
-Write-Host "Отчёты: $OutputDir" -ForegroundColor Cyan
 
-if ($Open) { Start-Process $html }
+exit 0
