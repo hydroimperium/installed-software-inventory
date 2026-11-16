@@ -48,6 +48,9 @@
 .PARAMETER NoSizes
     Не считать размеры папок — быстрый прогон, в отчёте будет «—».
 
+.PARAMETER NoEnrich
+    Не сверяться с winget и не проверять автозагрузку/подписи exe.
+
 .PARAMETER Audit
     Показать папки с exe, которые не попали в отчёт.
 
@@ -73,6 +76,7 @@ param(
     [string]$OverridesPath,
     [switch]$SkipShortcuts,
     [switch]$NoSizes,
+    [switch]$NoEnrich,
     [switch]$Audit,
     [switch]$Open,
     [switch]$Quiet,
@@ -83,7 +87,7 @@ param(
 $ErrorActionPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 
-$script:AppVersion = '1.0.0'
+$script:AppVersion = '1.1.0'
 $script:SourceErrors = New-Object System.Collections.ArrayList
 
 if ($Version) {
@@ -711,6 +715,7 @@ function Get-DiskApps($known) {
         $a = New-App -Name $name -Version $c.Version -Publisher $c.Company -Path $d -Source 'Диск' -Scope 'Пользователь' -Kind $kind
         $a.SizeMB = $c.SizeMB
         $a.Files = $c.Files
+        $a.Exe = $c.Exe
         [void]$out.Add($a)
     }
     return $out
@@ -762,6 +767,7 @@ function Get-ShortcutApps($known, [bool]$diskScanned = $true) {
             if ($st.SizeMB -lt $MinPortableSizeMB) { return }
             $a = New-App -Name $_.BaseName -Version '' -Publisher '' -Path $t -Source 'Ярлык' -Scope 'Пользователь' -Kind 'Портативно'
             $a.SizeMB = $st.SizeMB; $a.Files = $st.Files
+            $a.Exe = $t
             [void]$out.Add($a)
         }
     }
@@ -996,6 +1002,134 @@ function Add-Usage($apps) {
     return $apps
 }
 
+# ---------------------------------------------------------------- 11e. winget
+function Get-WingetTable {
+    $exe = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if (-not $exe) { return @() }
+    $lines = & winget.exe list --disable-interactivity --accept-source-agreements 2>$null
+    if (-not $lines) { return @() }
+    return @(ConvertFrom-WingetTable @($lines))
+}
+
+function Add-WingetInfo($apps) {
+    Write-Step 'Сверка с winget...'
+    $list = New-Object System.Collections.ArrayList
+    foreach ($a in @($apps)) { [void]$list.Add($a) }
+
+    $rows = Get-WingetTable
+    if (-not $rows.Count) { return , $list }
+
+    $byNorm = @{}
+    foreach ($r in $rows) {
+        $n = Get-Norm $r.Name
+        if ($n -and -not $byNorm.ContainsKey($n)) { $byNorm[$n] = $r }
+    }
+
+    $matched = @{}
+    foreach ($a in $list) {
+        $n = Get-Norm $a.Name
+        if ($n.Length -lt 4) { continue }
+        $hit = $null
+        if ($byNorm.ContainsKey($n)) { $hit = $byNorm[$n] }
+        else {
+            foreach ($k in $byNorm.Keys) {
+                if ($k.Length -ge 5 -and ($k -like "*$n*" -or $n -like "*$k*")) { $hit = $byNorm[$k]; break }
+            }
+        }
+        if (-not $hit) { continue }
+        $matched[$hit.Id] = 1
+        if ($hit.Id -match '^(ARP|MSIX)\\') { continue }
+        $a.WingetId = $hit.Id
+        if ($hit.Available) { $a.Upgrade = $hit.Available }
+    }
+
+    # пакеты, которых нет ни в одном другом источнике
+    foreach ($r in $rows) {
+        if ($matched.ContainsKey($r.Id)) { continue }
+        if ($r.Source -ne 'winget') { continue }
+        if ($r.Id -match '^(ARP|MSIX)\\') { continue }
+        if ($r.Name -match $SystemRx) { continue }
+        $a = New-App -Name $r.Name -Version $r.Version -Publisher '' -Path '' -Source 'winget' -Kind 'Установлено'
+        $a.WingetId = $r.Id
+        if ($r.Available) { $a.Upgrade = $r.Available }
+        [void]$list.Add($a)
+    }
+    return , $list
+}
+
+# ---------------------------------------------------------------- 11f. startup
+function Get-StartupCommands {
+    $cmds = New-Object System.Collections.ArrayList
+    foreach ($k in @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run',
+            'HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run')) {
+        $item = Get-Item -LiteralPath $k -ErrorAction SilentlyContinue
+        if (-not $item) { continue }
+        foreach ($name in $item.GetValueNames()) {
+            $v = [string]$item.GetValue($name)
+            if ($v) { [void]$cmds.Add($v) }
+        }
+    }
+    $shell = $null
+    try { $shell = New-Object -ComObject WScript.Shell } catch {}
+    foreach ($d in @([Environment]::GetFolderPath('Startup'), [Environment]::GetFolderPath('CommonStartup'))) {
+        if (-not $d -or -not (Test-Path -LiteralPath $d)) { continue }
+        Get-ChildItem -LiteralPath $d -Filter '*.lnk' -ErrorAction SilentlyContinue | ForEach-Object {
+            $t = ''
+            if ($shell) { try { $t = $shell.CreateShortcut($_.FullName).TargetPath } catch {} }
+            if ($t) { [void]$cmds.Add($t) }
+        }
+    }
+    return $cmds
+}
+
+function Add-StartupInfo($apps) {
+    Write-Step 'Автозагрузка...'
+    $cmds = Get-StartupCommands
+    if (-not $cmds.Count) { return , $apps }
+    $exes = @($cmds | ForEach-Object { (Get-ExeFromCommand $_).ToLower() } | Where-Object { $_ } | Sort-Object -Unique)
+    if (-not $exes.Count) { return , $apps }
+
+    foreach ($a in $apps) {
+        $target = ''
+        if ($a.Exe) { $target = $a.Exe.ToLower() }
+        elseif ($a.Path -and (Test-Path -LiteralPath $a.Path -PathType Leaf)) { $target = $a.Path.ToLower() }
+        $dir = ''
+        if ($a.Path -and (Test-Path -LiteralPath $a.Path -PathType Container)) { $dir = $a.Path.ToLower().TrimEnd('\') + '\' }
+        if (-not $target -and -not $dir) { continue }
+        $leaf = if ($target) { Split-Path -Leaf $target } else { '' }
+        foreach ($e in $exes) {
+            if (($target -and $e -eq $target) -or ($dir -and $e.StartsWith($dir)) -or ($leaf -and (Split-Path -Leaf $e) -eq $leaf)) {
+                $a.AutoStart = $true; break
+            }
+        }
+    }
+    return , $apps
+}
+
+# ---------------------------------------------------------------- 11g. signature
+function Add-SignatureInfo($apps) {
+    Write-Step 'Проверка подписи exe...'
+    $cache = @{}
+    foreach ($a in $apps) {
+        $exe = $a.Exe
+        if (-not $exe -and $a.Path -and (Test-Path -LiteralPath $a.Path -PathType Leaf)) { $exe = $a.Path }
+        if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { continue }
+        if (-not $cache.ContainsKey($exe)) {
+            $s = Get-AuthenticodeSignature -LiteralPath $exe -ErrorAction SilentlyContinue
+            $status = if ($s) { "$($s.Status)" } else { 'Unknown' }
+            $cache[$exe] = switch ($status) {
+                'Valid' { 'подписано' }
+                'NotSigned' { 'без подписи' }
+                default { 'ошибка подписи' }
+            }
+        }
+        $a.Signature = $cache[$exe]
+    }
+    return , $apps
+}
+
 # ---------------------------------------------------------------- 11d. copies
 
 
@@ -1012,6 +1146,9 @@ function Export-Report($apps, $skipped, $changes) {
 
     $all | Select-Object Category, Name, Version, Publisher,
         @{ n = 'SizeMB'; e = { Format-Inv $_.SizeMB } }, Files, Path, Copies, OtherPaths, Source, Scope, Kind, Exists, Uninstall,
+        WingetId, Upgrade,
+        @{ n = 'AutoStart'; e = { if ($_.AutoStart) { 'да' } else { '' } } },
+        Signature,
         @{ n = 'Change'; e = { $k = (Get-Norm $_.Name) + '|' + "$($_.Path)".ToLower(); if ($changes.New.ContainsKey($k)) { 'новое' } elseif ($changes.Updated.ContainsKey($k)) { 'обновлено' } else { '' } } },
         @{ n = 'LastRun'; e = { if ($_.LastRun) { $_.LastRun.ToString('yyyy-MM-dd HH:mm') } else { '' } } } |
         Export-Csv -Path (Join-Path $OutputDir 'software-inventory.csv') -NoTypeInformation -Encoding UTF8
@@ -1098,6 +1235,10 @@ tr:hover td{background:#141821}
 .badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.03em;vertical-align:middle}
 .b-new{background:#204a35;color:#6ee7a8}
 .b-upd{background:#3b3a1e;color:#e7d96e}
+.b-auto{background:#1e3a4a;color:#7fd8ff}
+.b-nosig{background:#4a1e1e;color:#ff9b9b}
+.upd{color:#f0c674;font-size:11px;white-space:nowrap}
+.sel{padding:6px 10px;border-radius:8px;border:1px solid var(--line);background:var(--panel);color:var(--txt);font:inherit;cursor:pointer}
 .plink{color:#9fb3d1;text-decoration:none;border-bottom:1px dotted #4a5568}
 .plink:hover{color:#cfe0ff;border-bottom-color:#5b9dff}
 .run{color:#9fb3d1;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -1134,6 +1275,7 @@ tr:hover td{background:#141821}
     if ($changes.HasPrev) {
         [void]$sb.AppendLine("<label class=`"sw`"><input type=`"checkbox`" id=`"onlyNew`"> только изменения</label>")
     }
+    [void]$sb.AppendLine('<select id="extra" class="sel" aria-label="Дополнительный фильтр"><option value="">все программы</option><option value="upg">есть обновление</option><option value="auto">в автозагрузке</option><option value="unsigned">без подписи</option><option value="winget">есть в winget</option></select>')
     [void]$sb.AppendLine('</div></header><main>')
     [void]$sb.AppendLine('<div class="cards" role="group" aria-label="Категории">')
     foreach ($cat in @('Приложение', 'Инструмент', 'Игра', 'Store', 'Системное')) {
@@ -1158,6 +1300,10 @@ tr:hover td{background:#141821}
         $badge = ''
         if ($isNew -eq '1') { $badge = ' <span class="badge b-new">новое</span>' }
         elseif ($isUpd -eq '1') { $badge = ' <span class="badge b-upd">обновлено</span>' }
+        if ($a.AutoStart) { $badge += ' <span class="badge b-auto" title="запускается при старте системы">автостарт</span>' }
+        if ($a.Signature -eq 'без подписи') { $badge += ' <span class="badge b-nosig" title="exe без цифровой подписи">без подписи</span>' }
+        $vCell = Esc $v
+        if ($a.Upgrade) { $vCell = "$vCell <span class=`"upd`" title=`"winget: доступно $($a.Upgrade)`">→ $(Esc $a.Upgrade)</span>" }
 
         $pathCell = Esc $p
         if ($a.Exists -eq 'нет') { $pathCell = "$pathCell <span class=`"gone`">(папки нет)</span>" }
@@ -1181,25 +1327,31 @@ tr:hover td{background:#141821}
             $extraPaths = Esc ($a.OtherPaths -replace '\|', "`n")
             $pathCell = "$pathCell <span class=`"copies`" title=`"ещё путей: $($a.Copies - 1)`n$extraPaths`">+$($a.Copies - 1)</span>"
         }
-        [void]$sb.AppendLine("<tr data-c=`"$($a.Category)`" data-sys=`"$sys`" data-ms=`"$ms`" data-new=`"$isNew`" data-upd=`"$isUpd`" data-run=`"$(if ($a.LastRun) { 1 } else { 0 })`" data-mb=`"$sizeInv`"><td class=`"n`">$i</td><td class=`"name`" data-v=`"$(Esc $a.Name)`">$(Esc $a.Name)$badge</td><td class=`"ver`" data-v=`"$(Esc $v)`">$(Esc $v)</td><td class=`"pub`" data-v=`"$(Esc $pub)`">$(Esc $pub)</td><td class=`"size`" data-v=`"$sizeInv`">$(Format-Size $a.SizeMB)</td><td class=`"$runCls`" data-v=`"$runV`" title=`"последний запуск по данным проводника`">$run</td><td class=`"path`" data-v=`"$(Esc $p)`">$pathCell</td><td><span class=`"tag $cls`">$($a.Category)</span></td></tr>")
+        $autoV = if ($a.AutoStart) { '1' } else { '0' }
+        $sigV = if ($a.Signature -eq 'без подписи') { '1' } else { '0' }
+        $upgV = if ($a.Upgrade) { '1' } else { '0' }
+        $wgV = if ($a.WingetId) { '1' } else { '0' }
+        [void]$sb.AppendLine("<tr data-c=`"$($a.Category)`" data-sys=`"$sys`" data-ms=`"$ms`" data-new=`"$isNew`" data-upd=`"$isUpd`" data-run=`"$(if ($a.LastRun) { 1 } else { 0 })`" data-auto=`"$autoV`" data-sig=`"$sigV`" data-upg=`"$upgV`" data-wg=`"$wgV`" data-mb=`"$sizeInv`"><td class=`"n`">$i</td><td class=`"name`" data-v=`"$(Esc $a.Name)`">$(Esc $a.Name)$badge</td><td class=`"ver`" data-v=`"$(Esc $v)`">$vCell</td><td class=`"pub`" data-v=`"$(Esc $pub)`">$(Esc $pub)</td><td class=`"size`" data-v=`"$sizeInv`">$(Format-Size $a.SizeMB)</td><td class=`"$runCls`" data-v=`"$runV`" title=`"последний запуск по данным проводника`">$run</td><td class=`"path`" data-v=`"$(Esc $p)`">$pathCell</td><td><span class=`"tag $cls`">$($a.Category)</span></td></tr>")
     }
     [void]$sb.AppendLine('</tbody></table><div class="empty" id="none" style="display:none">Ничего не найдено</div></main>')
     [void]$sb.AppendLine(@'
 <script>
 const q=document.getElementById('q'),rows=[...document.querySelectorAll('#t tbody tr')],none=document.getElementById('none');
-const chips=[...document.querySelectorAll('.chip')],hideSys=document.getElementById('hideSys'),hideMs=document.getElementById('hideMs'),onlyNew=document.getElementById('onlyNew'),onlyUnused=document.getElementById('onlyUnused');
+const chips=[...document.querySelectorAll('.chip')],hideSys=document.getElementById('hideSys'),hideMs=document.getElementById('hideMs'),onlyNew=document.getElementById('onlyNew'),onlyUnused=document.getElementById('onlyUnused'),extra=document.getElementById('extra');
 let active=new Set(chips.filter(c=>c.classList.contains('on')).map(c=>c.dataset.c));
 function apply(){const s=q.value.toLowerCase().trim();let n=0,mb=0;
+ const ex=extra?extra.value:'';
  rows.forEach(r=>{const okC=active.has(r.dataset.c);const okS=!s||r.textContent.toLowerCase().includes(s);
   const okY=!(hideSys.checked&&r.dataset.sys==='1');
   const okM=!(hideMs&&hideMs.checked&&(r.dataset.ms==='1'||r.dataset.sys==='1')&&r.dataset.run==='0');
   const okN=!(onlyNew&&onlyNew.checked&&r.dataset.new!=='1'&&r.dataset.upd!=='1');
   const okU=!(onlyUnused&&onlyUnused.checked&&r.dataset.run!=='0');
-  const show=okC&&okS&&okY&&okM&&okN&&okU;r.style.display=show?'':'none';if(show){n++;mb+=parseFloat(r.dataset.mb)||0;}});
+  const okE=!ex||(ex==='upg'&&r.dataset.upg==='1')||(ex==='auto'&&r.dataset.auto==='1')||(ex==='unsigned'&&r.dataset.sig==='1')||(ex==='winget'&&r.dataset.wg==='1');
+  const show=okC&&okS&&okY&&okM&&okN&&okU&&okE;r.style.display=show?'':'none';if(show){n++;mb+=parseFloat(r.dataset.mb)||0;}});
  none.style.display=n?'none':'block';
  document.getElementById('shown').textContent=n;
  document.getElementById('sum').textContent=(mb/1024).toFixed(1);}
-q.addEventListener('input',apply);hideSys.addEventListener('change',apply);if(hideMs)hideMs.addEventListener('change',apply);if(onlyNew)onlyNew.addEventListener('change',apply);if(onlyUnused)onlyUnused.addEventListener('change',apply);
+q.addEventListener('input',apply);hideSys.addEventListener('change',apply);if(hideMs)hideMs.addEventListener('change',apply);if(onlyNew)onlyNew.addEventListener('change',apply);if(onlyUnused)onlyUnused.addEventListener('change',apply);if(extra)extra.addEventListener('change',apply);
 chips.forEach(c=>c.addEventListener('click',()=>{const k=c.dataset.c;if(active.has(k)){active.delete(k);c.classList.remove('on')}else{active.add(k);c.classList.add('on')}apply();}));
 document.querySelectorAll('.card').forEach(card=>card.addEventListener('click',()=>{const chip=document.querySelector('.chip[data-c="'+card.dataset.c+'"]');if(chip)chip.click();}));
 document.querySelectorAll('th[data-s]').forEach(th=>{let asc=true;th.addEventListener('click',()=>{const tb=document.querySelector('#t tbody');const rs=[...tb.rows];const idx=[...th.parentNode.children].indexOf(th);
@@ -1289,6 +1441,11 @@ try {
 
     $apps = Apply-Overrides $apps $OverridesPath
     $apps = Test-Apps $apps
+    if (-not $NoEnrich) {
+        $apps = Add-WingetInfo $apps
+        $apps = Add-StartupInfo $apps
+        $apps = Add-SignatureInfo $apps
+    }
     $apps = Add-Usage $apps
     Write-Step 'Группировка копий...'
     $apps = Group-Copies $apps
@@ -1317,6 +1474,13 @@ try {
     foreach ($g in ($apps | Group-Object Category | Sort-Object Name)) { Write-Host ("  {0,-12} {1}" -f $g.Name, $g.Count) }
     Write-Host ("  Всего:       {0}" -f $apps.Count)
     if ($script:Skipped.Count) { Write-Host ("  Исключено:   {0} (см. excluded.csv)" -f $script:Skipped.Count) -ForegroundColor DarkYellow }
+    $wg = @($apps | Where-Object WingetId).Count
+    $upg = @($apps | Where-Object Upgrade).Count
+    $auto = @($apps | Where-Object AutoStart).Count
+    $nosig = @($apps | Where-Object { $_.Signature -eq 'без подписи' }).Count
+    if ($wg -or $upg -or $auto -or $nosig) {
+        Write-Host ("  winget: {0} · обновлений: {1} · автостарт: {2} · без подписи: {3}" -f $wg, $upg, $auto, $nosig) -ForegroundColor Cyan
+    }
     if ($changes.HasPrev) {
         Write-Host ("  Новых: {0} · обновлено: {1} · пропало: {2} (changes.csv)" -f $changes.New.Count, $changes.Updated.Count, $changes.Removed.Count) -ForegroundColor Cyan
     }

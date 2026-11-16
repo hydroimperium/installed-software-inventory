@@ -125,11 +125,31 @@ Assert-Equal 500 $grouped[0].SizeMB 'Group-Copies: сумма размеров'
 # ---------------------------------------------------------------- отчёт: HTML-эскейп
 Assert-Equal '&lt;b&gt;&amp;' (Esc '<b>&') 'Esc: html'
 
+# ---------------------------------------------------------------- winget
+$wHeader = 'Name'.PadRight(14) + 'Id'.PadRight(22) + 'Version'.PadRight(11) + 'Available'.PadRight(13) + 'Source'
+$wRow1 = 'Firefox'.PadRight(14) + 'Mozilla.Firefox'.PadRight(22) + '120.0'.PadRight(11) + '121.0'.PadRight(13) + 'winget'
+$wRow2 = 'AMD Thing'.PadRight(14) + 'ARP\Machine\X86\AMD'.PadRight(22) + '8.0'
+$wRows = @(ConvertFrom-WingetTable @($wHeader, ('-' * 72), $wRow1, $wRow2))
+Assert-Equal 2 $wRows.Count 'Winget: две строки'
+Assert-Equal 'Firefox' $wRows[0].Name 'Winget: имя'
+Assert-Equal 'Mozilla.Firefox' $wRows[0].Id 'Winget: id'
+Assert-Equal '120.0' $wRows[0].Version 'Winget: версия'
+Assert-Equal '121.0' $wRows[0].Available 'Winget: доступно'
+Assert-Equal 'winget' $wRows[0].Source 'Winget: источник'
+Assert-Equal '' $wRows[1].Available 'Winget: пустое обновление'
+Assert-Equal 0 @(ConvertFrom-WingetTable @('мусор')).Count 'Winget: нет заголовка'
+
+# ---------------------------------------------------------------- командные строки
+Assert-Equal 'C:\Program Files\Foo\foo.exe' (Get-ExeFromCommand '"C:\Program Files\Foo\foo.exe" --minimized') 'Cmd: кавычки'
+Assert-Equal 'C:\Tools\bar.exe' (Get-ExeFromCommand 'C:\Tools\bar.exe /silent') 'Cmd: без кавычек'
+Assert-Equal 'C:\Windows\System32\rundll32.exe' (Get-ExeFromCommand 'C:\Windows\System32\rundll32.exe "x.dll",Entry') 'Cmd: rundll32'
+Assert-Equal '' (Get-ExeFromCommand '') 'Cmd: пусто'
+
 # ---------------------------------------------------------------- smoke
 if ($IncludeSmoke) {
     $out = Join-Path $env:TEMP ('isi-smoke-' + [guid]::NewGuid().ToString('N'))
     $script = Join-Path $root 'Get-InstalledSoftware.ps1'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $script -NoStore -NoPortable -SkipShortcuts -NoSizes -OutputDir $out -Quiet | Out-Null
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $script -NoStore -NoPortable -SkipShortcuts -NoSizes -NoEnrich -OutputDir $out -Quiet | Out-Null
     Assert-Equal 0 $LASTEXITCODE 'Smoke: код выхода'
     foreach ($f in @('software-inventory.csv', 'software-inventory.html', 'excluded.csv')) {
         Assert-True (Test-Path (Join-Path $out $f)) "Smoke: есть $f"

@@ -87,6 +87,11 @@ function New-App {
         Copies    = 1
         OtherPaths = ''
         Extra     = ''
+        Exe       = ''
+        WingetId  = ''
+        Upgrade   = ''
+        AutoStart = $false
+        Signature = ''
     }
 }
 
@@ -156,3 +161,42 @@ function Group-Copies($apps) {
 
 function Esc([string]$s) { if (-not $s) { return '' }; return [System.Net.WebUtility]::HtmlEncode($s) }
 
+
+function ConvertFrom-WingetTable($lines) {
+    $rows = New-Object System.Collections.ArrayList
+    $headerIdx = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ("$($lines[$i])" -match '\bId\b.*\bVersion\b') { $headerIdx = $i; break }
+    }
+    if ($headerIdx -lt 0) { return $rows }
+
+    $h = "$($lines[$headerIdx])"
+    $idPos = $h.IndexOf('Id'); $verPos = $h.IndexOf('Version')
+    $avPos = $h.IndexOf('Available'); $srcPos = $h.IndexOf('Source')
+    if ($idPos -lt 1 -or $verPos -le $idPos -or $avPos -le $verPos -or $srcPos -le $avPos) { return $rows }
+
+    for ($i = $headerIdx + 2; $i -lt $lines.Count; $i++) {
+        $line = "$($lines[$i])"
+        if (-not $line.Trim()) { continue }
+        if ($line.Length -le $idPos) { continue }
+        $name = $line.Substring(0, $idPos).Trim()
+        if (-not $name -or $name -match '^-+$') { continue }
+        $id = $line.Substring($idPos, $verPos - $idPos).Trim()
+        if (-not $id) { continue }
+        $ver = if ($line.Length -gt $verPos) { $line.Substring($verPos, [math]::Min($avPos - $verPos, $line.Length - $verPos)).Trim() } else { '' }
+        $avail = if ($line.Length -gt $avPos) { $line.Substring($avPos, [math]::Min($srcPos - $avPos, $line.Length - $avPos)).Trim() } else { '' }
+        $src = if ($line.Length -gt $srcPos) { $line.Substring($srcPos).Trim() } else { '' }
+        [void]$rows.Add([pscustomobject]@{ Name = $name; Id = $id; Version = $ver; Available = $avail; Source = $src })
+    }
+    return $rows
+}
+
+function Get-ExeFromCommand([string]$cmd) {
+    if (-not $cmd) { return '' }
+    $c = $cmd.Trim()
+    if ($c -match '^"([^"]+?\.exe)"') { return $matches[1] }
+    if ($c -match '^([A-Za-z]:\\[^"]+?\.exe)\b') { return $matches[1] }
+    if ($c -match '^(\S+?\.exe)\b') { return $matches[1] }
+    if ($c -match '([A-Za-z]:\\[^"]+?\.exe)\b') { return $matches[1] }
+    return ''
+}
