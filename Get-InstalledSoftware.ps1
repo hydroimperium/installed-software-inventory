@@ -45,6 +45,9 @@
 .PARAMETER Open
     Открыть HTML-отчёт после сборки.
 
+.PARAMETER NoSizes
+    Не считать размеры папок — быстрый прогон, в отчёте будет «—».
+
 .PARAMETER Audit
     Показать папки с exe, которые не попали в отчёт.
 
@@ -69,6 +72,7 @@ param(
     [string[]]$ExtraRoots = @(),
     [string]$OverridesPath,
     [switch]$SkipShortcuts,
+    [switch]$NoSizes,
     [switch]$Audit,
     [switch]$Open,
     [switch]$Quiet,
@@ -808,6 +812,12 @@ function Test-Apps($apps) {
 
         if ($a.Path -and $a.Path -match '^[A-Za-z]:\\' -and -not $exists) {
             Add-Skipped $a.Name $a.Path 0 0 'путь не найден (остаток удаления)'
+            continue
+        }
+
+        if ($exists -and $NoSizes) {
+            if ($a.Path) { $a.Exists = 'да' }
+            [void]$out.Add($a)
             continue
         }
 

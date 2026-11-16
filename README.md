@@ -56,6 +56,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\Get-InstalledSoftware.ps1
 | `-ExtraRoots` | — | Дополнительные папки для поиска |
 | `-OverridesPath` | `.\overrides.psd1` | Файл ручных правок |
 | `-SkipShortcuts` | — | Не разбирать ярлыки «Пуск» и рабочего стола |
+| `-NoSizes` | — | Не считать размеры (быстрый прогон) |
 | `-Audit` | — | Показать папки с exe, которые не попали в отчёт |
 | `-Strict` | — | Код выхода 2, если хотя бы один источник упал |
 | `-Version` | — | Показать версию и выйти |

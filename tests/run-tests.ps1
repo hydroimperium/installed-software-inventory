@@ -129,7 +129,7 @@ Assert-Equal '&lt;b&gt;&amp;' (Esc '<b>&') 'Esc: html'
 if ($IncludeSmoke) {
     $out = Join-Path $env:TEMP ('isi-smoke-' + [guid]::NewGuid().ToString('N'))
     $script = Join-Path $root 'Get-InstalledSoftware.ps1'
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $script -NoStore -NoPortable -SkipShortcuts -OutputDir $out -Quiet | Out-Null
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $script -NoStore -NoPortable -SkipShortcuts -NoSizes -OutputDir $out -Quiet | Out-Null
     Assert-Equal 0 $LASTEXITCODE 'Smoke: код выхода'
     foreach ($f in @('software-inventory.csv', 'software-inventory.html', 'excluded.csv')) {
         Assert-True (Test-Path (Join-Path $out $f)) "Smoke: есть $f"
